@@ -16,12 +16,19 @@ class CensorEvent:
     word: str
     variant: int = 0
     mode: str = "reverse"
+    volume: float = 1.0
 
 
 class CensorTimeline:
-    def __init__(self, sample_rate: int, padding_ms: int = 90):
+    def __init__(
+        self,
+        sample_rate: int,
+        lead_padding_ms: int = 20,
+        tail_padding_ms: int = 80,
+    ):
         self.sample_rate = sample_rate
-        self.padding_samples = round(sample_rate * padding_ms / 1000)
+        self.lead_padding_samples = round(sample_rate * lead_padding_ms / 1000)
+        self.tail_padding_samples = round(sample_rate * tail_padding_ms / 1000)
         self._events: List[CensorEvent] = []
         self._lock = Lock()
 
@@ -32,10 +39,11 @@ class CensorTimeline:
         word: str,
         variant: int = 0,
         mode: str = "reverse",
+        volume: float = 1.0,
     ) -> bool:
-        start = max(0, start_sample - self.padding_samples)
-        end = max(start + 1, end_sample + self.padding_samples)
-        event = CensorEvent(start, end, word, variant, mode)
+        start = max(0, start_sample - self.lead_padding_samples)
+        end = max(start + 1, end_sample + self.tail_padding_samples)
+        event = CensorEvent(start, end, word, variant, mode, volume)
         normalized = normalize_word(word)
         with self._lock:
             # Sliding transcription windows can report the same word repeatedly.

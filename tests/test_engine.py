@@ -13,11 +13,13 @@ class EngineTests(unittest.TestCase):
             output_device=None,
             sample_rate=1000,
             mode="reverse",
+            crossfade_ms=0,
         )
         engine = CensorEngine(config, WordMatcher([]))
         source = np.arange(300, dtype=np.float32)
         engine._write_audio(source)
-        engine.timeline.padding_samples = 0
+        engine.timeline.lead_padding_samples = 0
+        engine.timeline.tail_padding_samples = 0
         engine.timeline.add(100, 200, "word")
 
         first = engine._apply_censor(source[100:150], 100)
@@ -51,12 +53,14 @@ class EngineTests(unittest.TestCase):
                 output_device=None,
                 sample_rate=1000,
                 mode=mode,
+                crossfade_ms=0,
             )
             engine = CensorEngine(config, WordMatcher([]))
             source = np.zeros(300, dtype=np.float32)
             engine._write_audio(source)
-            engine.timeline.padding_samples = 0
-            engine.timeline.add(100, 200, "word", variant=1, mode=mode)
+            engine.timeline.lead_padding_samples = 0
+            engine.timeline.tail_padding_samples = 0
+            engine.timeline.add(100, 200, "word", variant=1, mode=mode, volume=1.0)
 
             first = engine._apply_censor(source[100:150], 100)
             second = engine._apply_censor(source[150:200], 150)
@@ -85,17 +89,41 @@ class EngineTests(unittest.TestCase):
                 output_device=None,
                 sample_rate=1000,
                 mode="bark",
+                crossfade_ms=0,
             ),
             WordMatcher([]),
         )
         source = np.zeros(300, dtype=np.float32)
         engine._write_audio(source)
-        engine.timeline.padding_samples = 0
-        engine.timeline.add(100, 200, "word", variant=0, mode="bark")
+        engine.timeline.lead_padding_samples = 0
+        engine.timeline.tail_padding_samples = 0
+        engine.timeline.add(100, 200, "word", variant=0, mode="bark", volume=1.0)
         engine.set_mode("meow")
 
         actual = engine._apply_censor(source[100:200], 100)
         expected = engine.sound_library.part("bark", 0, 0, 100, 100)
+        np.testing.assert_allclose(actual, expected)
+
+    def test_existing_event_keeps_volume_after_runtime_change(self):
+        engine = CensorEngine(
+            EngineConfig(
+                input_device=None,
+                output_device=None,
+                sample_rate=1000,
+                mode="bark",
+                effect_volume=0.5,
+                crossfade_ms=0,
+            ),
+            WordMatcher([]),
+        )
+        source = np.zeros(300, dtype=np.float32)
+        engine._write_audio(source)
+        engine.timeline.lead_padding_samples = 0
+        engine.timeline.tail_padding_samples = 0
+        engine.timeline.add(100, 200, "word", variant=0, mode="bark", volume=0.5)
+        engine.set_effect_volume(2.0)
+        actual = engine._apply_censor(source[100:200], 100)
+        expected = engine.sound_library.part("bark", 0, 0, 100, 100) * 0.5
         np.testing.assert_allclose(actual, expected)
 
 

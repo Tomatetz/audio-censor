@@ -18,10 +18,14 @@ class RuntimeModeTests(unittest.TestCase):
             )
             with patch.object(web_gui, "ROOT", root):
                 with patch.object(web_gui, "DEFAULT_CONFIG", config):
-                    web_gui.write_runtime_mode("meow")
+                    web_gui.write_runtime_settings("meow", 1.25)
             self.assertEqual(
                 load_config(root / ".runtime-control.json")["mode"],
                 "meow",
+            )
+            self.assertEqual(
+                load_config(root / ".runtime-control.json")["effect_volume"],
+                1.25,
             )
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import io
+import errno
 import os
 import queue
 import re
@@ -9,14 +11,19 @@ import subprocess
 import sys
 import threading
 import webbrowser
+import wave
+from urllib.error import URLError
+from urllib.request import urlopen
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import sounddevice as sd
+import numpy as np
 
 from app import DEFAULT_CONFIG, load_config
+from censor.samples import SoundLibrary
 
 
 ROOT = Path(__file__).resolve().parent
@@ -26,6 +33,7 @@ WORDS_PATH = ROOT / "words.txt"
 RECORDINGS = ROOT / "recordings"
 HOST = "127.0.0.1"
 PORT = 8765
+MAX_PORT_ATTEMPTS = 10
 
 
 def highlight_rules(path: Path) -> list[dict[str, str]]:
@@ -62,14 +70,73 @@ def update_jsonc(path: Path, values: dict) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def write_runtime_mode(mode: str) -> None:
+def write_runtime_settings(mode: str, effect_volume: float) -> None:
     if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
         raise ValueError("Неизвестный режим обработки.")
     config = load_config(DEFAULT_CONFIG)
     path = ROOT / config.get("runtime_control_file", ".runtime-control.json")
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps({"mode": mode}), encoding="utf-8")
+    temporary.write_text(
+        json.dumps(
+            {
+                "mode": mode,
+                "effect_volume": max(0.0, min(2.0, float(effect_volume))),
+            }
+        ),
+        encoding="utf-8",
+    )
     temporary.replace(path)
+
+
+def validate_words_text(text: str) -> list[str]:
+    errors = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        value = raw.strip()
+        if not value or value.startswith("#"):
+            continue
+        if value == "*" or value == "re:":
+            errors.append(f"Строка {number}: пустой шаблон.")
+        elif value.startswith("re:"):
+            try:
+                re.compile(value[3:])
+            except re.error as error:
+                errors.append(f"Строка {number}: {error}.")
+    return errors
+
+
+def preview_wav(mode: str, volume: float, sample_rate: int = 48000) -> bytes:
+    duration = 0.9
+    count = round(sample_rate * duration)
+    if mode == "beep":
+        positions = np.arange(count, dtype=np.float32)
+        samples = 0.18 * np.sin(2 * np.pi * 880 * positions / sample_rate)
+    elif mode in {"bark", "meow"}:
+        library = SoundLibrary(ROOT / "assets" / "sounds", sample_rate)
+        samples = library.part(mode, 0, 0, count, count)
+    elif mode == "mute":
+        samples = np.zeros(count, dtype=np.float32)
+    else:
+        # A short reversed spoken-like sweep demonstrates the transformation.
+        positions = np.arange(count, dtype=np.float32)
+        samples = (
+            0.14
+            * np.sin(2 * np.pi * (180 + 220 * positions / count) * positions / sample_rate)
+        )[::-1]
+    samples = np.clip(samples * max(0.0, min(2.0, volume)), -1.0, 1.0)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes((samples * 32767).astype("<i2").tobytes())
+    return buffer.getvalue()
+
+
+def latest_report() -> dict | None:
+    reports = sorted(RECORDINGS.glob("*.report.json"), key=lambda path: path.stat().st_mtime)
+    if not reports:
+        return None
+    return json.loads(reports[-1].read_text(encoding="utf-8"))
 
 
 class AppState:
@@ -121,6 +188,37 @@ STATE = AppState()
 SERVER: ThreadingHTTPServer | None = None
 
 
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+def is_stream_censor_server(port: int) -> bool:
+    try:
+        with urlopen(f"http://{HOST}:{port}/api/health", timeout=0.5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            return data.get("app") == "stream-censor"
+    except (OSError, URLError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def find_or_create_server(
+    start_port: int = PORT,
+    attempts: int = MAX_PORT_ATTEMPTS,
+) -> tuple[ThreadingHTTPServer | None, int, bool]:
+    for port in range(start_port, start_port + attempts):
+        try:
+            return ReusableThreadingHTTPServer((HOST, port), Handler), port, False
+        except OSError as error:
+            if error.errno != errno.EADDRINUSE:
+                raise
+            if is_stream_censor_server(port):
+                return None, port, True
+    raise OSError(
+        f"Не удалось найти свободный порт в диапазоне "
+        f"{start_port}–{start_port + attempts - 1}"
+    )
+
+
 HTML = r"""<!doctype html>
 <html lang="ru">
 <head>
@@ -152,6 +250,19 @@ button { border:0; border-radius:8px; padding:10px; cursor:pointer; font-weight:
 button.stop { background:#b64252 } button:disabled { opacity:.45; cursor:default }
 .danger { width:100%; margin-top:16px; background:#8f2f3c }
 .full { width:100%; margin-top:8px }
+.inline { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center }
+.inline button { padding:9px 12px }
+.volume { display:flex; gap:10px; align-items:center }.volume input { flex:1 }
+.volume output { min-width:42px; text-align:right; color:var(--text) }
+.report { margin-top:12px; padding:10px; border:1px solid var(--line);
+  border-radius:8px; color:var(--muted); line-height:1.5 }
+dialog { width:min(720px,90vw); background:var(--panel); color:var(--text);
+  border:1px solid var(--line); border-radius:12px; padding:18px }
+dialog::backdrop { background:rgba(0,0,0,.65) }
+dialog textarea { width:100%; min-height:340px; resize:vertical; padding:12px;
+  background:#101218; color:var(--text); border:1px solid var(--line); border-radius:8px }
+.advanced-grid { display:grid; grid-template-columns:1fr 1fr; gap:0 18px }
+.advanced-grid .wide { grid-column:1 / -1 }
 .script,pre { width:100%; height:calc(100% - 28px); margin:0; padding:14px;
   border:1px solid var(--line); border-radius:8px; background:#101218; color:#e5e8ef;
   overflow:auto; line-height:1.45 }
@@ -169,29 +280,23 @@ pre { white-space:pre-wrap; font:12px Menlo,monospace }
     <h2>Настройки</h2>
     <label>Микрофон</label><select id="input_device"></select>
     <label>Вывод</label><select id="output_device"></select>
-    <label>Задержка, сек</label><input id="delay" type="number" step=".1">
-    <label>Окно распознавания, сек</label><input id="chunk" type="number" step=".1">
-    <label>Период распознавания, сек</label><input id="scan_every" type="number" step=".1">
-    <label>Модель</label><select id="model">
-      <option>tiny</option><option>base</option><option>small</option>
-      <option>medium</option><option>large-v3</option></select>
-    <label>Beam size</label><input id="beam_size" type="number" min="1" max="10">
-    <label>Обработка — меняется на лету</label><select id="mode" onchange="changeMode()">
+    <label>Обработка — меняется на лету</label><div class="inline"><select id="mode" onchange="changeRuntimeSettings()">
       <option value="reverse">Проиграть наоборот</option>
       <option value="beep">ПИП</option>
       <option value="bark">Гавканье</option>
       <option value="meow">Мяуканье</option>
       <option value="mute">Заглушить</option>
-    </select>
-    <label class="check"><input id="debug_transcript" type="checkbox">Показывать распознанный текст</label>
-    <label class="check"><input id="record_output" type="checkbox">Записывать WAV</label>
-    <label class="check"><input id="record_transcript" type="checkbox">Сохранять журнал TXT</label>
+    </select><button onclick="previewEffect()">▶</button></div>
+    <label>Громкость эффекта</label><div class="volume"><input id="effect_volume" type="range" min="0" max="2" step="0.05" oninput="volume_value.value=this.value" onchange="changeRuntimeSettings()"><output id="volume_value">1.0</output></div>
     <div class="buttons">
       <button id="start" class="primary" onclick="startApp()">▶ Запустить</button>
       <button id="stop" class="stop" onclick="stopApp()">■ Остановить</button>
     </div>
     <button class="full" onclick="save()">Сохранить настройки</button>
+    <button class="full" onclick="document.querySelector('#advanced_dialog').showModal()">Расширенные настройки</button>
+    <button class="full" onclick="openWords()">Редактировать словарь</button>
     <button class="full" onclick="openRecordings()">Открыть папку записей</button>
+    <div id="report" class="report">Отчётов пока нет.</div>
     <button class="danger" onclick="closeApp()">Закрыть приложение</button>
   </section>
   <section class="right">
@@ -199,8 +304,38 @@ pre { white-space:pre-wrap; font:12px Menlo,monospace }
     <div class="panel"><h2>Журнал</h2><pre id="log"></pre></div>
   </section>
 </main>
+<dialog id="advanced_dialog">
+  <h2>Расширенные настройки</h2>
+  <div class="advanced-grid">
+    <div><label>Задержка, сек</label><input id="delay" type="number" step=".1"></div>
+    <div><label>Окно распознавания, сек</label><input id="chunk" type="number" step=".1"></div>
+    <div><label>Период распознавания, сек</label><input id="scan_every" type="number" step=".1"></div>
+    <div><label>Подтверждений слова</label><input id="confirmation_count" type="number" min="1" max="4"></div>
+    <div><label>Стабилизация, сек</label><input id="stability_delay" type="number" min="0" max="3" step=".1"></div>
+    <div><label>Модель</label><select id="model">
+      <option>tiny</option><option>base</option><option>small</option>
+      <option>medium</option><option>large-v3</option></select></div>
+    <div><label>Beam size</label><input id="beam_size" type="number" min="1" max="10"></div>
+    <div class="wide">
+      <label class="check"><input id="debug_transcript" type="checkbox">Показывать распознанный текст</label>
+      <label class="check"><input id="debug_hypotheses" type="checkbox">Показывать сырые гипотезы</label>
+      <label class="check"><input id="record_output" type="checkbox">Записывать WAV</label>
+      <label class="check"><input id="record_transcript" type="checkbox">Сохранять журнал TXT</label>
+    </div>
+  </div>
+  <div class="buttons">
+    <button onclick="document.querySelector('#advanced_dialog').close()">Закрыть</button>
+    <button class="primary" onclick="saveAdvanced()">Сохранить</button>
+  </div>
+</dialog>
+<dialog id="words_dialog">
+  <h2>Словарь замены</h2>
+  <p>Одна запись на строку: слово, основа со звёздочкой или <code>re:выражение</code>.</p>
+  <textarea id="words_editor"></textarea>
+  <div class="buttons"><button onclick="document.querySelector('#words_dialog').close()">Отмена</button><button class="primary" onclick="saveWords()">Сохранить</button></div>
+</dialog>
 <script>
-const ids=["delay","chunk","scan_every","model","beam_size","mode","debug_transcript","record_output","record_transcript"];
+const ids=["delay","chunk","scan_every","confirmation_count","stability_delay","model","beam_size","mode","effect_volume","debug_transcript","debug_hypotheses","record_output","record_transcript"];
 function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function matchesRule(word,rules){const w=word.toLocaleLowerCase("ru");return rules.some(r=>{if(r.type==="prefix")return w.startsWith(r.value);if(r.type==="exact")return w===r.value;if(r.type==="regex"){try{return new RegExp("^(?:"+r.value+")$","iu").test(w)}catch(e){return false}}return false})}
 function highlightScript(text,rules){let out="",last=0;const rx=/[\p{L}\p{N}_ё]+/giu;for(const m of text.matchAll(rx)){out+=escapeHtml(text.slice(last,m.index));const word=m[0];out+=matchesRule(word,rules)?`<mark>${escapeHtml(word)}</mark>`:escapeHtml(word);last=m.index+word.length}return out+escapeHtml(text.slice(last))}
@@ -217,13 +352,20 @@ async function load(){
     d.outputs.forEach(x=>option(out,x.id,x.label));
     inp.value=String(c.input_device); out.value=c.output_device===null?"null":String(c.output_device);
     ids.forEach(id=>{const e=document.querySelector("#"+id);e.type==="checkbox"?e.checked=!!c[id]:e.value=c[id]});
-    document.querySelector("#script").innerHTML=highlightScript(d.script,d.highlight_rules); updateState(d.running);
+    document.querySelector("#script").innerHTML=highlightScript(d.script,d.highlight_rules);
+    document.querySelector("#volume_value").value=Number(c.effect_volume||1).toFixed(2);
+    renderReport(d.report); updateState(d.running);
   } catch(e){document.querySelector("#status").textContent=e.message}
 }
 function values(){const input=document.querySelector("#input_device"),output=document.querySelector("#output_device");const v={input_device:Number(input.value),output_device:output.value==="null"?null:Number(output.value)};
   ids.forEach(id=>{const e=document.querySelector("#"+id);v[id]=e.type==="checkbox"?e.checked:(e.type==="number"?Number(e.value):e.value)});return v}
 async function save(){try{await api("/api/config",{method:"POST",body:JSON.stringify(values())});document.querySelector("#status").textContent="Настройки сохранены";return true}catch(e){alert(e.message);return false}}
-async function changeMode(){const mode=document.querySelector("#mode").value;try{await api("/api/mode",{method:"POST",body:JSON.stringify({mode})});document.querySelector("#status").textContent="Режим изменён: "+document.querySelector("#mode").selectedOptions[0].text}catch(e){alert(e.message)}}
+async function saveAdvanced(){if(await save())document.querySelector("#advanced_dialog").close()}
+async function changeRuntimeSettings(){const mode=document.querySelector("#mode").value,effect_volume=Number(document.querySelector("#effect_volume").value);document.querySelector("#volume_value").value=effect_volume.toFixed(2);try{await api("/api/runtime",{method:"POST",body:JSON.stringify({mode,effect_volume})});document.querySelector("#status").textContent="Настройки эффекта применены"}catch(e){alert(e.message)}}
+async function previewEffect(){const mode=document.querySelector("#mode").value,volume=document.querySelector("#effect_volume").value;try{await new Audio(`/api/preview?mode=${encodeURIComponent(mode)}&volume=${encodeURIComponent(volume)}&t=${Date.now()}`).play()}catch(e){document.querySelector("#status").textContent="Браузер заблокировал звук — нажми Preview ещё раз"}}
+async function openWords(){const d=await api("/api/words");document.querySelector("#words_editor").value=d.text;document.querySelector("#words_dialog").showModal()}
+async function saveWords(){try{const text=document.querySelector("#words_editor").value;const d=await api("/api/words",{method:"POST",body:JSON.stringify({text})});document.querySelector("#script").innerHTML=highlightScript(d.script,d.highlight_rules);document.querySelector("#words_dialog").close();document.querySelector("#status").textContent=d.restart_required?"Словарь сохранён — перезапусти фильтр для применения":"Словарь сохранён"}catch(e){alert(e.message)}}
+function renderReport(r){const el=document.querySelector("#report");if(!r){el.textContent="Отчётов пока нет.";return}const min=r.min_margin===null?"—":Number(r.min_margin).toFixed(1)+" с";el.innerHTML=`<b>Последняя сессия</b><br>Заменено: ${r.censored}, MISS: ${r.miss}, RISK: ${r.risk}, LATE: ${r.late}<br>Минимальный запас: ${min}<br>Рекомендуемая задержка: <b>${r.recommended_delay} с</b>`}
 async function startApp(){if(!await save())return;try{await api("/api/start",{method:"POST",body:"{}"});updateState(true)}catch(e){alert(e.message)}}
 async function stopApp(){await api("/api/stop",{method:"POST",body:"{}"})}
 async function openRecordings(){await api("/api/open-recordings",{method:"POST",body:"{}"})}
@@ -238,7 +380,7 @@ async function closeApp(){
   },300);
 }
 function updateState(r){document.querySelector("#start").disabled=r;document.querySelector("#stop").disabled=!r;document.querySelector("#status").textContent=r?"Фильтр работает":"Готов к запуску"}
-async function poll(){try{const d=await api("/api/log");const p=document.querySelector("#log");if(p.textContent!==d.log){p.textContent=d.log;p.scrollTop=p.scrollHeight}updateState(d.running)}catch(e){}setTimeout(poll,700)}
+async function poll(){try{const d=await api("/api/log");const p=document.querySelector("#log");if(p.textContent!==d.log){p.textContent=d.log;p.scrollTop=p.scrollHeight}updateState(d.running);if(!d.running&&d.report)renderReport(d.report)}catch(e){}setTimeout(poll,700)}
 load();poll();
 </script>
 </body></html>"""
@@ -287,11 +429,35 @@ class Handler(BaseHTTPRequestHandler):
                     "script": TEST_SCRIPT.read_text(encoding="utf-8"),
                     "highlight_rules": highlight_rules(WORDS_PATH),
                     "running": STATE.running(),
+                    "report": latest_report(),
                 })
             except Exception as error:
                 self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif path == "/api/log":
-            self._json({"log": STATE.log_text(), "running": STATE.running()})
+            self._json(
+                {
+                    "log": STATE.log_text(),
+                    "running": STATE.running(),
+                    "report": None if STATE.running() else latest_report(),
+                }
+            )
+        elif path == "/api/health":
+            self._json({"app": "stream-censor", "running": STATE.running()})
+        elif path == "/api/words":
+            self._json({"text": WORDS_PATH.read_text(encoding="utf-8")})
+        elif path == "/api/preview":
+            parameters = parse_qs(urlparse(self.path).query)
+            mode = parameters.get("mode", ["beep"])[0]
+            volume = float(parameters.get("volume", ["1"])[0])
+            if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
+                mode = "beep"
+            body = preview_wav(mode, volume)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self._json({"error": "Не найдено"}, HTTPStatus.NOT_FOUND)
 
@@ -305,7 +471,8 @@ class Handler(BaseHTTPRequestHandler):
                 allowed = {
                     "input_device", "output_device", "delay", "chunk", "scan_every",
                     "model", "beam_size", "mode", "debug_transcript", "record_output",
-                    "record_transcript",
+                    "record_transcript", "effect_volume", "confirmation_count",
+                    "stability_delay", "debug_hypotheses",
                 }
                 update_jsonc(DEFAULT_CONFIG, {k: v for k, v in values.items() if k in allowed})
                 self._json({"ok": True})
@@ -315,14 +482,41 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/stop":
                 STATE.stop()
                 self._json({"ok": True})
-            elif path == "/api/mode":
-                mode = str(self._body().get("mode", ""))
+            elif path == "/api/runtime":
+                data = self._body()
+                mode = str(data.get("mode", ""))
+                effect_volume = float(data.get("effect_volume", 1.0))
                 if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
                     raise ValueError("Неизвестный режим обработки.")
-                update_jsonc(DEFAULT_CONFIG, {"mode": mode})
+                if not 0 <= effect_volume <= 2:
+                    raise ValueError("Громкость должна быть от 0 до 2.")
+                update_jsonc(
+                    DEFAULT_CONFIG,
+                    {"mode": mode, "effect_volume": effect_volume},
+                )
                 if STATE.running():
-                    write_runtime_mode(mode)
-                self._json({"ok": True, "mode": mode})
+                    write_runtime_settings(mode, effect_volume)
+                self._json(
+                    {
+                        "ok": True,
+                        "mode": mode,
+                        "effect_volume": effect_volume,
+                    }
+                )
+            elif path == "/api/words":
+                text = str(self._body().get("text", ""))
+                errors = validate_words_text(text)
+                if errors:
+                    raise ValueError("\n".join(errors))
+                WORDS_PATH.write_text(text.rstrip() + "\n", encoding="utf-8")
+                self._json(
+                    {
+                        "ok": True,
+                        "script": TEST_SCRIPT.read_text(encoding="utf-8"),
+                        "highlight_rules": highlight_rules(WORDS_PATH),
+                        "restart_required": STATE.running(),
+                    }
+                )
             elif path == "/api/open-recordings":
                 RECORDINGS.mkdir(exist_ok=True)
                 subprocess.Popen(["open", str(RECORDINGS)])
@@ -350,9 +544,18 @@ def shutdown_application() -> None:
 
 def main() -> None:
     global SERVER
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    try:
+        server, port, already_running = find_or_create_server()
+    except OSError as error:
+        print(f"Не удалось запустить Stream Censor: {error}", flush=True)
+        return
+    url = f"http://{HOST}:{port}"
+    if already_running:
+        print(f"Stream Censor уже запущен: {url}", flush=True)
+        webbrowser.open(url)
+        return
+    assert server is not None
     SERVER = server
-    url = f"http://{HOST}:{PORT}"
     print(f"Stream Censor: {url}")
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:

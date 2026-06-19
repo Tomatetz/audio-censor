@@ -111,6 +111,11 @@ def build_parser(defaults: dict | None = None) -> argparse.ArgumentParser:
         default=defaults.get("debug_transcript", False),
     )
     parser.add_argument(
+        "--debug-hypotheses",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.get("debug_hypotheses", False),
+    )
+    parser.add_argument(
         "--debug-words",
         action=argparse.BooleanOptionalAction,
         default=defaults.get("debug_words", False),
@@ -137,6 +142,41 @@ def build_parser(defaults: dict | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--runtime-control-file",
         default=defaults.get("runtime_control_file", ".runtime-control.json"),
+    )
+    parser.add_argument(
+        "--effect-volume",
+        type=float,
+        default=defaults.get("effect_volume", 1.0),
+    )
+    parser.add_argument(
+        "--confirmation-count",
+        type=int,
+        default=defaults.get("confirmation_count", 2),
+    )
+    parser.add_argument(
+        "--stability-delay",
+        type=float,
+        default=defaults.get("stability_delay", 0.7),
+    )
+    parser.add_argument(
+        "--word-time-tolerance",
+        type=float,
+        default=defaults.get("word_time_tolerance", 0.4),
+    )
+    parser.add_argument(
+        "--censor-lead-ms",
+        type=int,
+        default=defaults.get("censor_lead_ms", 20),
+    )
+    parser.add_argument(
+        "--censor-tail-ms",
+        type=int,
+        default=defaults.get("censor_tail_ms", 80),
+    )
+    parser.add_argument(
+        "--crossfade-ms",
+        type=int,
+        default=defaults.get("crossfade_ms", 8),
     )
     parser.add_argument("--words", default=defaults.get("words", "words.txt"))
     return parser
@@ -186,12 +226,20 @@ def main() -> None:
         beep_frequency=args.beep_frequency,
         beam_size=args.beam_size,
         debug_transcript=args.debug_transcript,
+        debug_hypotheses=args.debug_hypotheses,
         debug_words=args.debug_words,
         safety_margin=args.safety_margin,
         record_output=args.record_output,
         record_transcript=args.record_transcript,
         recordings_directory=args.recordings_directory,
         runtime_control_file=args.runtime_control_file,
+        effect_volume=args.effect_volume,
+        confirmation_count=args.confirmation_count,
+        stability_delay=args.stability_delay,
+        word_time_tolerance=args.word_time_tolerance,
+        censor_lead_ms=args.censor_lead_ms,
+        censor_tail_ms=args.censor_tail_ms,
+        crossfade_ms=args.crossfade_ms,
     )
     print(f"Настройки загружены из: {args.config}")
     engine = CensorEngine(config, WordMatcher.from_file(args.words))

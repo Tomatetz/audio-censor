@@ -17,6 +17,7 @@ from faster_whisper import WhisperModel
 from .matcher import WordMatcher
 from .recorder import TranscriptRecorder, WavRecorder
 from .samples import SoundLibrary
+from .streaming import StreamingWordStabilizer, WordObservation
 from .timeline import CensorTimeline
 
 
@@ -36,12 +37,20 @@ class EngineConfig:
     beep_frequency: float = 880.0
     beam_size: int = 3
     debug_transcript: bool = False
+    debug_hypotheses: bool = False
     debug_words: bool = False
     safety_margin: float = 0.8
     record_output: bool = True
     record_transcript: bool = True
     recordings_directory: str = "recordings"
     runtime_control_file: str = ".runtime-control.json"
+    effect_volume: float = 1.0
+    confirmation_count: int = 2
+    stability_delay: float = 0.7
+    word_time_tolerance: float = 0.4
+    censor_lead_ms: int = 20
+    censor_tail_ms: int = 80
+    crossfade_ms: int = 8
 
 
 class CensorEngine:
@@ -50,7 +59,17 @@ class CensorEngine:
     def __init__(self, config: EngineConfig, matcher: WordMatcher):
         self.config = config
         self.matcher = matcher
-        self.timeline = CensorTimeline(config.sample_rate)
+        self.timeline = CensorTimeline(
+            config.sample_rate,
+            lead_padding_ms=config.censor_lead_ms,
+            tail_padding_ms=config.censor_tail_ms,
+        )
+        self.stabilizer = StreamingWordStabilizer(
+            sample_rate=config.sample_rate,
+            confirmation_count=config.confirmation_count,
+            stability_delay=config.stability_delay,
+            time_tolerance=config.word_time_tolerance,
+        )
         sounds_path = Path(__file__).resolve().parent.parent / "assets" / "sounds"
         self.sound_library = SoundLibrary(sounds_path, config.sample_rate)
         capacity_seconds = config.delay_seconds + config.chunk_seconds + 5
@@ -63,9 +82,19 @@ class CensorEngine:
         self._recognizer: Optional[threading.Thread] = None
         self._control_thread: Optional[threading.Thread] = None
         self._mode_lock = threading.Lock()
+        self._settings_lock = threading.Lock()
         self.recorder: Optional[WavRecorder] = None
         self.transcript: Optional[TranscriptRecorder] = None
         self._last_sound_variant = {"bark": -1, "meow": -1}
+        self.stats = {
+            "censored": 0,
+            "miss": 0,
+            "risk": 0,
+            "late": 0,
+            "min_margin": None,
+            "modes": {},
+        }
+        self.report_path: Optional[Path] = None
 
     def current_mode(self) -> str:
         with self._mode_lock:
@@ -83,6 +112,15 @@ class CensorEngine:
                 sample = self.write_sample
             self._transcript_event("MODE", sample, sample, f"{old_mode} → {mode}")
 
+    def effect_volume(self) -> float:
+        with self._settings_lock:
+            return self.config.effect_volume
+
+    def set_effect_volume(self, volume: float) -> None:
+        volume = max(0.0, min(2.0, float(volume)))
+        with self._settings_lock:
+            self.config.effect_volume = volume
+
     def _control_loop(self) -> None:
         path = Path(self.config.runtime_control_file)
         last_mtime = 0
@@ -94,6 +132,8 @@ class CensorEngine:
                 last_mtime = mtime
                 data = json.loads(path.read_text(encoding="utf-8"))
                 self.set_mode(str(data.get("mode", "")))
+                if "effect_volume" in data:
+                    self.set_effect_volume(float(data["effect_volume"]))
             except (OSError, json.JSONDecodeError):
                 continue
 
@@ -174,7 +214,7 @@ class CensorEngine:
                 replacement = np.zeros(count, dtype=np.float32)
             elif event.mode == "beep":
                 positions = np.arange(overlap_start, overlap_end, dtype=np.float32)
-                replacement = 0.18 * np.sin(
+                replacement = event.volume * 0.18 * np.sin(
                     2
                     * math.pi
                     * self.config.beep_frequency
@@ -193,6 +233,28 @@ class CensorEngine:
                     count,
                     event.end_sample - event.start_sample,
                 )
+                replacement *= event.volume
+            fade_samples = min(
+                round(self.config.crossfade_ms * self.config.sample_rate / 1000),
+                count // 2,
+            )
+            if fade_samples > 0:
+                relative = np.arange(event_offset, event_offset + count)
+                event_length = event.end_sample - event.start_sample
+                blend = np.ones(count, dtype=np.float32)
+                blend = np.minimum(
+                    blend, np.clip(relative / fade_samples, 0.0, 1.0)
+                )
+                blend = np.minimum(
+                    blend,
+                    np.clip(
+                        (event_length - 1 - relative) / fade_samples,
+                        0.0,
+                        1.0,
+                    ),
+                )
+                original = samples[destination_start:destination_end]
+                replacement = original * (1.0 - blend) + replacement * blend
             output[destination_start:destination_end] = replacement
         return output
 
@@ -263,116 +325,120 @@ class CensorEngine:
                     no_repeat_ngram_size=3,
                     hallucination_silence_threshold=1.0,
                 )
-                for segment in segments:
-                    if self.config.debug_transcript and segment.text.strip():
-                        print(f"[heard] {segment.text.strip()}", flush=True)
-                    segment_start = start + round(
-                        segment.start * self.config.sample_rate
-                    )
-                    segment_end = start + round(
-                        segment.end * self.config.sample_rate
-                    )
+                segment_list = list(segments)
+                observations = []
+                hypotheses = []
+                for segment in segment_list:
                     if segment.text.strip():
-                        self._transcript_event(
-                            "ASR",
-                            segment_start,
-                            segment_end,
-                            segment.text.strip(),
+                        hypotheses.append(segment.text.strip())
+                    for word in segment.words or ():
+                        observation = WordObservation(
+                            text=word.word,
+                            start_sample=start
+                            + round(word.start * self.config.sample_rate),
+                            end_sample=start
+                            + round(word.end * self.config.sample_rate),
+                            probability=float(getattr(word, "probability", 1.0)),
                         )
-                    words = tuple(segment.words or ())
-                    matched_segment = False
-                    for word in words:
+                        observations.append(observation)
                         if self.config.debug_words:
-                            matched = "MATCH" if self.matcher.matches(word.word) else "-"
+                            matched = (
+                                "MATCH" if self.matcher.matches(word.word) else "-"
+                            )
                             print(
-                                f"[word] {word.start:4.2f}–{word.end:4.2f} "
+                                f"[word] {observation.start_sample / self.config.sample_rate:6.2f}–"
+                                f"{observation.end_sample / self.config.sample_rate:6.2f} "
                                 f"{word.word!r} {matched}",
                                 flush=True,
                             )
-                        if not self.matcher.matches(word.word):
-                            continue
-                        matched_segment = True
-                        word_start = start + round(word.start * self.config.sample_rate)
-                        word_end = start + round(word.end * self.config.sample_rate)
-                        with self.audio_lock:
-                            current_endpoint = self.write_sample
-                        playback_position = current_endpoint - round(
-                            self.config.delay_seconds * self.config.sample_rate
-                        )
-                        seconds_until_output = (
-                            word_start - playback_position
-                        ) / self.config.sample_rate
-                        if word_start <= playback_position:
-                            self._transcript_event(
-                                "LATE",
-                                word_start,
-                                word_end,
-                                f"{word.word.strip()!r}; не заменено",
-                            )
-                            print(
-                                f"[late] {word.word.strip()!r}; "
-                                f"опоздание {-seconds_until_output:.1f} с — "
-                                "увеличьте --delay",
-                                flush=True,
-                            )
-                            continue
-                        if seconds_until_output < self.config.safety_margin:
-                            self._transcript_event(
-                                "RISK",
-                                word_start,
-                                word_end,
-                                f"{word.word.strip()!r}; "
-                                f"запас {seconds_until_output:.1f} с",
-                            )
-                            print(
-                                f"[risk] {word.word.strip()!r}; до выхода только "
-                                f"{seconds_until_output:.1f} с. Увеличьте --delay "
-                                f"минимум на "
-                                f"{self.config.safety_margin - seconds_until_output:.1f} с",
-                                flush=True,
-                            )
-                        event_mode = self.current_mode()
-                        variant = self._choose_sound_variant(event_mode)
-                        if self.timeline.add(
-                            word_start,
-                            word_end,
-                            word.word,
-                            variant=variant,
-                            mode=event_mode,
-                        ):
-                            self._transcript_event(
-                                f"CENSOR:{event_mode}",
-                                word_start,
-                                word_end,
-                                f"{word.word.strip()!r}; "
-                                f"вариант {variant + 1}; "
-                                f"запас {max(0.0, seconds_until_output):.1f} с",
-                            )
-                            print(
-                                f"[censor] {word.word.strip()!r}; "
-                                f"до выхода {max(0.0, seconds_until_output):.1f} с",
-                                flush=True,
-                            )
-                    if (
-                        self.config.debug_transcript
-                        and not matched_segment
-                        and self.matcher.matches_text(segment.text)
-                    ):
-                        tokens = " | ".join(repr(word.word) for word in words)
-                        self._transcript_event(
-                            "MISS",
-                            segment_start,
-                            segment_end,
-                            f"{segment.text.strip()} | токены: "
-                            f"{tokens or '(пусто)'}",
-                        )
-                        print(
-                            "[miss] Целевое слово видно в тексте сегмента, "
-                            f"но отсутствует среди word timestamps: {tokens or '(пусто)'}",
-                            flush=True,
-                        )
+                if self.config.debug_hypotheses and hypotheses:
+                    print(f"[hypothesis] {' '.join(hypotheses)}", flush=True)
+
+                stable_words = self.stabilizer.ingest(observations, endpoint)
+                if stable_words:
+                    stable_text = "".join(word.text for word in stable_words).strip()
+                    if self.config.debug_transcript:
+                        print(f"[stable] {stable_text}", flush=True)
+                    self._transcript_event(
+                        "ASR:STABLE",
+                        stable_words[0].start_sample,
+                        stable_words[-1].end_sample,
+                        stable_text,
+                    )
+                for word in stable_words:
+                    self._handle_stable_word(word)
             except Exception as error:
                 print(f"[recognizer] {error}", flush=True)
+
+    def _handle_stable_word(self, word: WordObservation) -> None:
+        if not self.matcher.matches(word.text):
+            return
+        word_start = word.start_sample
+        word_end = word.end_sample
+        with self.audio_lock:
+            current_endpoint = self.write_sample
+        playback_position = current_endpoint - round(
+            self.config.delay_seconds * self.config.sample_rate
+        )
+        seconds_until_output = (
+            word_start - playback_position
+        ) / self.config.sample_rate
+        if word_start <= playback_position:
+            self.stats["late"] += 1
+            self._transcript_event(
+                "LATE", word_start, word_end, f"{word.text.strip()!r}; не заменено"
+            )
+            print(
+                f"[late] {word.text.strip()!r}; "
+                f"опоздание {-seconds_until_output:.1f} с — увеличьте --delay",
+                flush=True,
+            )
+            return
+        if seconds_until_output < self.config.safety_margin:
+            self.stats["risk"] += 1
+            self._transcript_event(
+                "RISK",
+                word_start,
+                word_end,
+                f"{word.text.strip()!r}; запас {seconds_until_output:.1f} с",
+            )
+            print(
+                f"[risk] {word.text.strip()!r}; до выхода только "
+                f"{seconds_until_output:.1f} с",
+                flush=True,
+            )
+        event_mode = self.current_mode()
+        event_volume = self.effect_volume()
+        variant = self._choose_sound_variant(event_mode)
+        if self.timeline.add(
+            word_start,
+            word_end,
+            word.text,
+            variant=variant,
+            mode=event_mode,
+            volume=event_volume,
+        ):
+            self.stats["censored"] += 1
+            modes = self.stats["modes"]
+            modes[event_mode] = modes.get(event_mode, 0) + 1
+            minimum = self.stats["min_margin"]
+            self.stats["min_margin"] = (
+                seconds_until_output
+                if minimum is None
+                else min(minimum, seconds_until_output)
+            )
+            self._transcript_event(
+                f"CENSOR:{event_mode}",
+                word_start,
+                word_end,
+                f"{word.text.strip()!r}; вариант {variant + 1}; "
+                f"запас {max(0.0, seconds_until_output):.1f} с",
+            )
+            print(
+                f"[censor] {word.text.strip()!r}; "
+                f"до выхода {max(0.0, seconds_until_output):.1f} с",
+                flush=True,
+            )
 
     def run(self):
         print(f"Загрузка модели {self.config.model!r}…", flush=True)
@@ -383,7 +449,12 @@ class CensorEngine:
         )
         control_path = Path(self.config.runtime_control_file)
         control_path.write_text(
-            json.dumps({"mode": self.current_mode()}),
+            json.dumps(
+                {
+                    "mode": self.current_mode(),
+                    "effect_volume": self.effect_volume(),
+                }
+            ),
             encoding="utf-8",
         )
         self._control_thread = threading.Thread(
@@ -394,6 +465,7 @@ class CensorEngine:
         recording_directory = Path(self.config.recordings_directory)
         recording_path = recording_directory / f"processed_{timestamp}.wav"
         transcript_path = recording_directory / f"processed_{timestamp}.txt"
+        self.report_path = recording_directory / f"processed_{timestamp}.report.json"
         if self.config.record_transcript:
             self.transcript = TranscriptRecorder(transcript_path)
             self.transcript.start(
@@ -452,3 +524,29 @@ class CensorEngine:
             if self.transcript:
                 self.transcript.close()
                 print(f"Расшифровка сохранена: {self.transcript.path}", flush=True)
+            self._save_report()
+
+    def _save_report(self) -> None:
+        if not self.report_path:
+            return
+        minimum = self.stats["min_margin"]
+        if self.stats["late"]:
+            recommended = self.config.delay_seconds + 2.0
+        elif minimum is None:
+            recommended = self.config.delay_seconds
+        else:
+            recommended = self.config.delay_seconds + max(
+                0.0, self.config.safety_margin - minimum
+            )
+        report = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "delay": self.config.delay_seconds,
+            "recommended_delay": round(recommended, 1),
+            **self.stats,
+        }
+        self.report_path.parent.mkdir(parents=True, exist_ok=True)
+        self.report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"Отчёт сохранён: {self.report_path}", flush=True)
