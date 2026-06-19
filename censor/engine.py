@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import json
 import threading
 import time
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ class EngineConfig:
     record_output: bool = True
     record_transcript: bool = True
     recordings_directory: str = "recordings"
+    runtime_control_file: str = ".runtime-control.json"
 
 
 class CensorEngine:
@@ -59,9 +61,41 @@ class CensorEngine:
         self.stop_event = threading.Event()
         self.model: Optional[WhisperModel] = None
         self._recognizer: Optional[threading.Thread] = None
+        self._control_thread: Optional[threading.Thread] = None
+        self._mode_lock = threading.Lock()
         self.recorder: Optional[WavRecorder] = None
         self.transcript: Optional[TranscriptRecorder] = None
         self._last_sound_variant = {"bark": -1, "meow": -1}
+
+    def current_mode(self) -> str:
+        with self._mode_lock:
+            return self.config.mode
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
+            return
+        with self._mode_lock:
+            old_mode = self.config.mode
+            self.config.mode = mode
+        if old_mode != mode:
+            print(f"[mode] {old_mode} → {mode}", flush=True)
+            with self.audio_lock:
+                sample = self.write_sample
+            self._transcript_event("MODE", sample, sample, f"{old_mode} → {mode}")
+
+    def _control_loop(self) -> None:
+        path = Path(self.config.runtime_control_file)
+        last_mtime = 0
+        while not self.stop_event.wait(0.15):
+            try:
+                mtime = path.stat().st_mtime_ns
+                if mtime == last_mtime:
+                    continue
+                last_mtime = mtime
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self.set_mode(str(data.get("mode", "")))
+            except (OSError, json.JSONDecodeError):
+                continue
 
     def _choose_sound_variant(self, kind: str) -> int:
         count = self.sound_library.count(kind)
@@ -127,39 +161,39 @@ class CensorEngine:
         if not mask.any():
             return samples
         output = samples.copy()
-        if self.config.mode == "mute":
-            output[mask] = 0
-        elif self.config.mode == "beep":
-            positions = np.arange(len(samples), dtype=np.float32) + timeline_start
-            tone = 0.18 * np.sin(
-                2 * math.pi * self.config.beep_frequency * positions / self.config.sample_rate
-            )
-            output[mask] = tone[mask]
-        else:
-            block_end = timeline_start + len(samples)
-            for event in self.timeline.events_for(timeline_start, len(samples)):
-                overlap_start = max(timeline_start, event.start_sample)
-                overlap_end = min(block_end, event.end_sample)
-                destination_start = overlap_start - timeline_start
-                destination_end = overlap_end - timeline_start
-                event_offset = overlap_start - event.start_sample
-                count = overlap_end - overlap_start
+        block_end = timeline_start + len(samples)
+        for event in self.timeline.events_for(timeline_start, len(samples)):
+            overlap_start = max(timeline_start, event.start_sample)
+            overlap_end = min(block_end, event.end_sample)
+            destination_start = overlap_start - timeline_start
+            destination_end = overlap_end - timeline_start
+            event_offset = overlap_start - event.start_sample
+            count = overlap_end - overlap_start
 
-                if self.config.mode == "reverse":
-                    # Read corresponding positions from the complete word in
-                    # reverse order, so callback boundaries stay inaudible.
-                    reverse_start = event.end_sample - overlap_end
-                    original_start = event.start_sample + reverse_start
-                    replacement = self._read_audio(original_start, count)[::-1]
-                else:
-                    replacement = self.sound_library.part(
-                        self.config.mode,
-                        event.variant,
-                        event_offset,
-                        count,
-                        event.end_sample - event.start_sample,
-                    )
-                output[destination_start:destination_end] = replacement
+            if event.mode == "mute":
+                replacement = np.zeros(count, dtype=np.float32)
+            elif event.mode == "beep":
+                positions = np.arange(overlap_start, overlap_end, dtype=np.float32)
+                replacement = 0.18 * np.sin(
+                    2
+                    * math.pi
+                    * self.config.beep_frequency
+                    * positions
+                    / self.config.sample_rate
+                )
+            elif event.mode == "reverse":
+                reverse_start = event.end_sample - overlap_end
+                original_start = event.start_sample + reverse_start
+                replacement = self._read_audio(original_start, count)[::-1]
+            else:
+                replacement = self.sound_library.part(
+                    event.mode,
+                    event.variant,
+                    event_offset,
+                    count,
+                    event.end_sample - event.start_sample,
+                )
+            output[destination_start:destination_end] = replacement
         return output
 
     def _audio_callback(self, indata, outdata, frames, _time_info, status):
@@ -297,15 +331,17 @@ class CensorEngine:
                                 f"{self.config.safety_margin - seconds_until_output:.1f} с",
                                 flush=True,
                             )
-                        variant = self._choose_sound_variant(self.config.mode)
+                        event_mode = self.current_mode()
+                        variant = self._choose_sound_variant(event_mode)
                         if self.timeline.add(
                             word_start,
                             word_end,
                             word.word,
                             variant=variant,
+                            mode=event_mode,
                         ):
                             self._transcript_event(
-                                f"CENSOR:{self.config.mode}",
+                                f"CENSOR:{event_mode}",
                                 word_start,
                                 word_end,
                                 f"{word.word.strip()!r}; "
@@ -345,6 +381,15 @@ class CensorEngine:
             device="auto",
             compute_type=self.config.compute_type,
         )
+        control_path = Path(self.config.runtime_control_file)
+        control_path.write_text(
+            json.dumps({"mode": self.current_mode()}),
+            encoding="utf-8",
+        )
+        self._control_thread = threading.Thread(
+            target=self._control_loop, name="runtime-control", daemon=True
+        )
+        self._control_thread.start()
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         recording_directory = Path(self.config.recordings_directory)
         recording_path = recording_directory / f"processed_{timestamp}.wav"
@@ -352,7 +397,7 @@ class CensorEngine:
         if self.config.record_transcript:
             self.transcript = TranscriptRecorder(transcript_path)
             self.transcript.start(
-                mode=self.config.mode,
+                mode=self.current_mode(),
                 delay=self.config.delay_seconds,
                 model=self.config.model,
                 words=self.matcher.hotwords,
@@ -368,7 +413,7 @@ class CensorEngine:
             print(f"Запись обработанного звука: {recording_path}", flush=True)
         print(
             f"Фильтр запущен: задержка {self.config.delay_seconds:.1f} с, "
-            f"режим {self.config.mode}, "
+            f"режим {self.current_mode()}, "
             f"вывод {'отключён' if self.config.output_device is None else 'включён'}. "
             "Ctrl+C — остановить.",
             flush=True,
@@ -399,6 +444,8 @@ class CensorEngine:
             self.stop_event.set()
             if self._recognizer:
                 self._recognizer.join(timeout=2)
+            if self._control_thread:
+                self._control_thread.join(timeout=1)
             if self.recorder:
                 self.recorder.close()
                 print(f"Запись сохранена: {self.recorder.path}", flush=True)

@@ -15,6 +15,7 @@ class CensorEvent:
     end_sample: int
     word: str
     variant: int = 0
+    mode: str = "reverse"
 
 
 class CensorTimeline:
@@ -30,10 +31,11 @@ class CensorTimeline:
         end_sample: int,
         word: str,
         variant: int = 0,
+        mode: str = "reverse",
     ) -> bool:
         start = max(0, start_sample - self.padding_samples)
         end = max(start + 1, end_sample + self.padding_samples)
-        event = CensorEvent(start, end, word, variant)
+        event = CensorEvent(start, end, word, variant, mode)
         normalized = normalize_word(word)
         with self._lock:
             # Sliding transcription windows can report the same word repeatedly.

@@ -34,7 +34,7 @@
 	// Что делать с найденным словом:
 	// reverse — проиграть наоборот, beep — ПИП,
 	// bark — гавканье, meow — мяуканье, mute — заглушить.
-	"mode": "meow",
+	"mode": "reverse",
 
 	// Частота сигнала в герцах. Используется только при mode="beep".
 	"beep_frequency": 880.0,
@@ -67,5 +67,8 @@
 	"recordings_directory": "recordings",
 
 	// Путь к файлу со словами, которые нужно обрабатывать.
-	"words": "words.txt"
+	"words": "words.txt",
+
+	// Служебный файл для переключения обработки на лету из интерфейса.
+	"runtime_control_file": ".runtime-control.json"
 }

@@ -62,6 +62,16 @@ def update_jsonc(path: Path, values: dict) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def write_runtime_mode(mode: str) -> None:
+    if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
+        raise ValueError("Неизвестный режим обработки.")
+    config = load_config(DEFAULT_CONFIG)
+    path = ROOT / config.get("runtime_control_file", ".runtime-control.json")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps({"mode": mode}), encoding="utf-8")
+    temporary.replace(path)
+
+
 class AppState:
     def __init__(self) -> None:
         self.process: subprocess.Popen[str] | None = None
@@ -166,7 +176,7 @@ pre { white-space:pre-wrap; font:12px Menlo,monospace }
       <option>tiny</option><option>base</option><option>small</option>
       <option>medium</option><option>large-v3</option></select>
     <label>Beam size</label><input id="beam_size" type="number" min="1" max="10">
-    <label>Обработка</label><select id="mode">
+    <label>Обработка — меняется на лету</label><select id="mode" onchange="changeMode()">
       <option value="reverse">Проиграть наоборот</option>
       <option value="beep">ПИП</option>
       <option value="bark">Гавканье</option>
@@ -213,6 +223,7 @@ async function load(){
 function values(){const input=document.querySelector("#input_device"),output=document.querySelector("#output_device");const v={input_device:Number(input.value),output_device:output.value==="null"?null:Number(output.value)};
   ids.forEach(id=>{const e=document.querySelector("#"+id);v[id]=e.type==="checkbox"?e.checked:(e.type==="number"?Number(e.value):e.value)});return v}
 async function save(){try{await api("/api/config",{method:"POST",body:JSON.stringify(values())});document.querySelector("#status").textContent="Настройки сохранены";return true}catch(e){alert(e.message);return false}}
+async function changeMode(){const mode=document.querySelector("#mode").value;try{await api("/api/mode",{method:"POST",body:JSON.stringify({mode})});document.querySelector("#status").textContent="Режим изменён: "+document.querySelector("#mode").selectedOptions[0].text}catch(e){alert(e.message)}}
 async function startApp(){if(!await save())return;try{await api("/api/start",{method:"POST",body:"{}"});updateState(true)}catch(e){alert(e.message)}}
 async function stopApp(){await api("/api/stop",{method:"POST",body:"{}"})}
 async function openRecordings(){await api("/api/open-recordings",{method:"POST",body:"{}"})}
@@ -304,6 +315,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/stop":
                 STATE.stop()
                 self._json({"ok": True})
+            elif path == "/api/mode":
+                mode = str(self._body().get("mode", ""))
+                if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
+                    raise ValueError("Неизвестный режим обработки.")
+                update_jsonc(DEFAULT_CONFIG, {"mode": mode})
+                if STATE.running():
+                    write_runtime_mode(mode)
+                self._json({"ok": True, "mode": mode})
             elif path == "/api/open-recordings":
                 RECORDINGS.mkdir(exist_ok=True)
                 subprocess.Popen(["open", str(RECORDINGS)])

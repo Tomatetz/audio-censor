@@ -56,7 +56,7 @@ class EngineTests(unittest.TestCase):
             source = np.zeros(300, dtype=np.float32)
             engine._write_audio(source)
             engine.timeline.padding_samples = 0
-            engine.timeline.add(100, 200, "word", variant=1)
+            engine.timeline.add(100, 200, "word", variant=1, mode=mode)
 
             first = engine._apply_censor(source[100:150], 100)
             second = engine._apply_censor(source[150:200], 150)
@@ -77,6 +77,26 @@ class EngineTests(unittest.TestCase):
         for mode in ("bark", "meow"):
             variants = [engine._choose_sound_variant(mode) for _ in range(20)]
             self.assertTrue(all(a != b for a, b in zip(variants, variants[1:])))
+
+    def test_existing_event_keeps_mode_after_runtime_change(self):
+        engine = CensorEngine(
+            EngineConfig(
+                input_device=None,
+                output_device=None,
+                sample_rate=1000,
+                mode="bark",
+            ),
+            WordMatcher([]),
+        )
+        source = np.zeros(300, dtype=np.float32)
+        engine._write_audio(source)
+        engine.timeline.padding_samples = 0
+        engine.timeline.add(100, 200, "word", variant=0, mode="bark")
+        engine.set_mode("meow")
+
+        actual = engine._apply_censor(source[100:200], 100)
+        expected = engine.sound_library.part("bark", 0, 0, 100, 100)
+        np.testing.assert_allclose(actual, expected)
 
 
 if __name__ == "__main__":

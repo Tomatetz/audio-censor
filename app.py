@@ -134,6 +134,10 @@ def build_parser(defaults: dict | None = None) -> argparse.ArgumentParser:
         "--recordings-directory",
         default=defaults.get("recordings_directory", "recordings"),
     )
+    parser.add_argument(
+        "--runtime-control-file",
+        default=defaults.get("runtime_control_file", ".runtime-control.json"),
+    )
     parser.add_argument("--words", default=defaults.get("words", "words.txt"))
     return parser
 
@@ -187,6 +191,7 @@ def main() -> None:
         record_output=args.record_output,
         record_transcript=args.record_transcript,
         recordings_directory=args.recordings_directory,
+        runtime_control_file=args.runtime_control_file,
     )
     print(f"Настройки загружены из: {args.config}")
     engine = CensorEngine(config, WordMatcher.from_file(args.words))
