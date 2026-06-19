@@ -15,6 +15,7 @@ import sounddevice as sd
 from faster_whisper import WhisperModel
 
 from .matcher import WordMatcher
+from .paths import resource_root
 from .recorder import TranscriptRecorder, WavRecorder
 from .samples import SoundLibrary
 from .streaming import StreamingWordStabilizer, WordObservation
@@ -70,7 +71,7 @@ class CensorEngine:
             stability_delay=config.stability_delay,
             time_tolerance=config.word_time_tolerance,
         )
-        sounds_path = Path(__file__).resolve().parent.parent / "assets" / "sounds"
+        sounds_path = resource_root() / "assets" / "sounds"
         self.sound_library = SoundLibrary(sounds_path, config.sample_rate)
         capacity_seconds = config.delay_seconds + config.chunk_seconds + 5
         self.capacity = round(capacity_seconds * config.sample_rate)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import errno
+import multiprocessing
 import os
 import queue
 import re
@@ -23,11 +24,13 @@ import sounddevice as sd
 import numpy as np
 
 from app import DEFAULT_CONFIG, load_config
+from censor.paths import data_root, ensure_user_data, resource_root
 from censor.samples import SoundLibrary
 
 
-ROOT = Path(__file__).resolve().parent
-APP_PATH = ROOT / "app.py"
+RESOURCE_ROOT = resource_root()
+ROOT = ensure_user_data()
+APP_PATH = RESOURCE_ROOT / "app.py"
 TEST_SCRIPT = ROOT / "test_script.txt"
 WORDS_PATH = ROOT / "words.txt"
 RECORDINGS = ROOT / "recordings"
@@ -111,7 +114,7 @@ def preview_wav(mode: str, volume: float, sample_rate: int = 48000) -> bytes:
         positions = np.arange(count, dtype=np.float32)
         samples = 0.18 * np.sin(2 * np.pi * 880 * positions / sample_rate)
     elif mode in {"bark", "meow"}:
-        library = SoundLibrary(ROOT / "assets" / "sounds", sample_rate)
+        library = SoundLibrary(RESOURCE_ROOT / "assets" / "sounds", sample_rate)
         samples = library.part(mode, 0, 0, count, count)
     elif mode == "mute":
         samples = np.zeros(count, dtype=np.float32)
@@ -157,8 +160,13 @@ class AppState:
         if self.running():
             return
         self.append_log("\n=== Новый запуск ===\n")
+        command = (
+            [sys.executable, "--engine"]
+            if getattr(sys, "frozen", False)
+            else [sys.executable, "-u", str(APP_PATH)]
+        )
         self.process = subprocess.Popen(
-            [sys.executable, "-u", str(APP_PATH)],
+            command,
             cwd=str(ROOT),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -543,6 +551,12 @@ def shutdown_application() -> None:
 
 
 def main() -> None:
+    if "--engine" in sys.argv:
+        from app import main as engine_main
+
+        sys.argv = [argument for argument in sys.argv if argument != "--engine"]
+        engine_main()
+        return
     global SERVER
     try:
         server, port, already_running = find_or_create_server()
@@ -569,4 +583,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

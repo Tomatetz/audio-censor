@@ -7,3 +7,7 @@ models/
 recordings/
 assets/sounds/quack/
 .runtime-control.json
+build/
+dist/
+*.spec.bak
+.pyinstaller-cache/

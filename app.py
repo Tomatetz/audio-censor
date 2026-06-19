@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
+from censor.paths import ensure_user_data
 
-DEFAULT_CONFIG = Path(__file__).with_name("config.jsonc")
+
+DEFAULT_CONFIG = ensure_user_data() / "config.jsonc"
 
 
 def strip_json_comments(text: str) -> str:
@@ -183,6 +186,8 @@ def build_parser(defaults: dict | None = None) -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    user_root = ensure_user_data()
+    os.chdir(user_root)
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     config_args, _ = config_parser.parse_known_args()

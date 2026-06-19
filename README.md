@@ -27,6 +27,28 @@ python -m pip install -r requirements.txt
 Для передачи обработанного звука в OBS на macOS удобно использовать виртуальное
 аудиоустройство [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole).
 
+### Готовое приложение macOS
+
+После сборки приложение находится в `dist/Stream Censor.app` и не требует
+установленных Python или `.venv`. Его можно перенести в `/Applications`.
+
+Пользовательские настройки, словарь и записи хранятся в:
+
+```text
+~/Library/Application Support/Stream Censor
+```
+
+Первая загрузка модели Whisper требует интернет. Локальная сборка подписывается
+ad-hoc; для публичного распространения потребуется Apple Developer ID и
+нотаризация.
+
+Сборка из исходников:
+
+```bash
+python -m pip install -r requirements-build.txt
+./build_macos.sh
+```
+
 ## Запуск
 
 ### Графический интерфейс
