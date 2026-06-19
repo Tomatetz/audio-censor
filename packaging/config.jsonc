@@ -26,5 +26,6 @@
   "record_transcript": true,
   "recordings_directory": "recordings",
   "words": "words.txt",
-  "runtime_control_file": ".runtime-control.json"
+  "runtime_control_file": ".runtime-control.json",
+  "runtime_status_file": ".runtime-status.json"
 }

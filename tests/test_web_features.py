@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -54,6 +55,48 @@ class WebFeaturesTests(unittest.TestCase):
             newer.touch()
             with patch.object(web_gui, "RECORDINGS", root):
                 self.assertEqual(web_gui.latest_report()["censored"], 2)
+
+    def test_marks_stale_runtime_status_as_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.jsonc"
+            config.write_text(
+                '{"runtime_status_file": ".runtime-status.json"}',
+                encoding="utf-8",
+            )
+            (root / ".runtime-status.json").write_text(
+                json.dumps(
+                    {
+                        "updated_at": time.time() - 10,
+                        "overall": "green",
+                        "audio_state": "running",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(web_gui, "ROOT", root),
+                patch.object(web_gui, "DEFAULT_CONFIG", config),
+            ):
+                status = web_gui.runtime_status()
+
+            self.assertEqual(status["overall"], "red")
+            self.assertEqual(status["audio_state"], "error")
+
+    def test_dashboard_replaces_large_log_panel(self):
+        self.assertIn('class="panel cluster-panel"', web_gui.HTML)
+        self.assertIn('id="mic_segments"', web_gui.HTML)
+        self.assertIn('id="risk_lamp"', web_gui.HTML)
+        self.assertIn('mini-log display-panel', web_gui.HTML)
+        self.assertIn('panel display-panel', web_gui.HTML)
+        self.assertIn('h1::before { content:"SC-86 // "', web_gui.HTML)
+        self.assertIn('.check input:checked', web_gui.HTML)
+        self.assertIn('function enhanceSelect(select)', web_gui.HTML)
+        self.assertIn('className="custom-select-option"', web_gui.HTML)
+        self.assertLess(
+            web_gui.HTML.index('<div class="mini-log display-panel"><h2>Журнал</h2>'),
+            web_gui.HTML.index('class="panel cluster-panel"'),
+        )
 
 
 if __name__ == "__main__":

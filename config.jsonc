@@ -52,7 +52,7 @@
 	// Что делать с найденным словом:
 	// reverse — проиграть наоборот, beep — ПИП,
 	// bark — гавканье, meow — мяуканье, mute — заглушить.
-	"mode": "beep",
+	"mode": "bark",
 
 	// Частота сигнала в герцах. Используется только при mode="beep".
 	"beep_frequency": 880.0,
@@ -94,5 +94,8 @@
 	"words": "words.txt",
 
 	// Служебный файл для переключения обработки на лету из интерфейса.
-	"runtime_control_file": ".runtime-control.json"
+	"runtime_control_file": ".runtime-control.json",
+
+	// Служебный файл с живыми индикаторами состояния для интерфейса.
+	"runtime_status_file": ".runtime-status.json"
 }

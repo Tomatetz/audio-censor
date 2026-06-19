@@ -45,6 +45,7 @@ class EngineConfig:
     record_transcript: bool = True
     recordings_directory: str = "recordings"
     runtime_control_file: str = ".runtime-control.json"
+    runtime_status_file: str = ".runtime-status.json"
     effect_volume: float = 1.0
     confirmation_count: int = 2
     stability_delay: float = 0.7
@@ -82,8 +83,20 @@ class CensorEngine:
         self.model: Optional[WhisperModel] = None
         self._recognizer: Optional[threading.Thread] = None
         self._control_thread: Optional[threading.Thread] = None
+        self._status_thread: Optional[threading.Thread] = None
         self._mode_lock = threading.Lock()
         self._settings_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._status_write_lock = threading.Lock()
+        self._runtime_status = {
+            "phase": "starting",
+            "model_state": "waiting",
+            "audio_state": "waiting",
+            "mic_rms": 0.0,
+            "mic_peak": 0.0,
+            "clipping": False,
+            "last_error": None,
+        }
         self.recorder: Optional[WavRecorder] = None
         self.transcript: Optional[TranscriptRecorder] = None
         self._last_sound_variant = {"bark": -1, "meow": -1}
@@ -137,6 +150,76 @@ class CensorEngine:
                     self.set_effect_volume(float(data["effect_volume"]))
             except (OSError, json.JSONDecodeError):
                 continue
+
+    def _set_runtime_status(self, **values) -> None:
+        with self._status_lock:
+            self._runtime_status.update(values)
+
+    def _update_audio_metrics(self, samples: np.ndarray) -> None:
+        samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if not len(samples):
+            return
+        rms = float(np.sqrt(np.mean(np.square(samples))))
+        peak = float(np.max(np.abs(samples)))
+        with self._status_lock:
+            # A little smoothing keeps the meter readable without hiding peaks.
+            previous_rms = float(self._runtime_status["mic_rms"])
+            previous_peak = float(self._runtime_status["mic_peak"])
+            self._runtime_status["mic_rms"] = previous_rms * 0.72 + rms * 0.28
+            self._runtime_status["mic_peak"] = max(peak, previous_peak * 0.78)
+            self._runtime_status["clipping"] = peak >= 0.98 or (
+                bool(self._runtime_status["clipping"]) and previous_peak >= 0.9
+            )
+
+    def runtime_status(self) -> dict:
+        with self._status_lock:
+            status = dict(self._runtime_status)
+        minimum = self.stats["min_margin"]
+        if status["phase"] == "error" or status["audio_state"] == "error":
+            overall = "red"
+        elif status["phase"] in {"starting", "loading"}:
+            overall = "yellow"
+        elif status["phase"] == "running":
+            if self.stats["late"]:
+                overall = "red"
+            elif (
+                self.stats["risk"]
+                or status["clipping"]
+                or (minimum is not None and minimum < self.config.safety_margin)
+            ):
+                overall = "yellow"
+            else:
+                overall = "green"
+        else:
+            overall = "idle"
+        return {
+            "updated_at": time.time(),
+            "overall": overall,
+            **status,
+            "mode": self.current_mode(),
+            "censored": self.stats["censored"],
+            "risk": self.stats["risk"],
+            "late": self.stats["late"],
+            "min_margin": minimum,
+        }
+
+    def _write_runtime_status(self) -> None:
+        path = Path(self.config.runtime_status_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with self._status_write_lock:
+            temporary.write_text(
+                json.dumps(self.runtime_status(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+
+    def _status_loop(self) -> None:
+        while not self.stop_event.wait(0.25):
+            try:
+                self._write_runtime_status()
+            except OSError:
+                pass
 
     def _choose_sound_variant(self, kind: str) -> int:
         count = self.sound_library.count(kind)
@@ -270,6 +353,7 @@ class CensorEngine:
         self._process_input(indata[:, 0], frames)
 
     def _process_input(self, input_samples: np.ndarray, frames: int) -> np.ndarray:
+        self._update_audio_metrics(input_samples)
         block_start = self._write_audio(input_samples)
         delay = round(self.config.delay_seconds * self.config.sample_rate)
         playback_start = block_start - delay
@@ -442,12 +526,29 @@ class CensorEngine:
             )
 
     def run(self):
-        print(f"Загрузка модели {self.config.model!r}…", flush=True)
-        self.model = WhisperModel(
-            self.config.model,
-            device="auto",
-            compute_type=self.config.compute_type,
+        self._set_runtime_status(phase="loading", model_state="loading")
+        self._write_runtime_status()
+        self._status_thread = threading.Thread(
+            target=self._status_loop, name="runtime-status", daemon=True
         )
+        self._status_thread.start()
+        print(f"Загрузка модели {self.config.model!r}…", flush=True)
+        try:
+            self.model = WhisperModel(
+                self.config.model,
+                device="auto",
+                compute_type=self.config.compute_type,
+            )
+            self._set_runtime_status(model_state="ready", audio_state="starting")
+        except Exception as error:
+            self._set_runtime_status(
+                phase="error",
+                model_state="error",
+                last_error=str(error),
+            )
+            self._write_runtime_status()
+            self.stop_event.set()
+            raise
         control_path = Path(self.config.runtime_control_file)
         control_path.write_text(
             json.dumps(
@@ -511,14 +612,33 @@ class CensorEngine:
                     callback=self._audio_callback,
                 )
             with stream:
+                self._set_runtime_status(phase="running", audio_state="running")
                 while not self.stop_event.wait(0.5):
                     pass
+        except Exception as error:
+            self._set_runtime_status(
+                phase="error",
+                audio_state="error",
+                last_error=str(error),
+            )
+            raise
         finally:
             self.stop_event.set()
             if self._recognizer:
                 self._recognizer.join(timeout=2)
             if self._control_thread:
                 self._control_thread.join(timeout=1)
+            with self._status_lock:
+                failed = self._runtime_status["phase"] == "error"
+            if not failed:
+                self._set_runtime_status(
+                    phase="stopped",
+                    audio_state="stopped",
+                    model_state="stopped",
+                )
+            self._write_runtime_status()
+            if self._status_thread:
+                self._status_thread.join(timeout=1)
             if self.recorder:
                 self.recorder.close()
                 print(f"Запись сохранена: {self.recorder.path}", flush=True)

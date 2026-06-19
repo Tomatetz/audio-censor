@@ -126,6 +126,42 @@ class EngineTests(unittest.TestCase):
         expected = engine.sound_library.part("bark", 0, 0, 100, 100) * 0.5
         np.testing.assert_allclose(actual, expected)
 
+    def test_runtime_status_contains_live_audio_and_censor_metrics(self):
+        engine = CensorEngine(
+            EngineConfig(input_device=None, output_device=None, sample_rate=1000),
+            WordMatcher([]),
+        )
+        engine._set_runtime_status(
+            phase="running",
+            model_state="ready",
+            audio_state="running",
+        )
+        engine._update_audio_metrics(np.full(100, 0.25, dtype=np.float32))
+        engine.stats["censored"] = 3
+        engine.stats["min_margin"] = 1.4
+
+        status = engine.runtime_status()
+
+        self.assertEqual(status["overall"], "green")
+        self.assertEqual(status["censored"], 3)
+        self.assertEqual(status["min_margin"], 1.4)
+        self.assertGreater(status["mic_rms"], 0)
+
+    def test_runtime_status_warns_about_clipping(self):
+        engine = CensorEngine(
+            EngineConfig(input_device=None, output_device=None),
+            WordMatcher([]),
+        )
+        engine._set_runtime_status(
+            phase="running",
+            model_state="ready",
+            audio_state="running",
+        )
+        engine._update_audio_metrics(np.ones(100, dtype=np.float32))
+
+        self.assertEqual(engine.runtime_status()["overall"], "yellow")
+        self.assertTrue(engine.runtime_status()["clipping"])
+
 
 if __name__ == "__main__":
     unittest.main()

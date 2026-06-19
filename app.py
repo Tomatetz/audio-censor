@@ -147,6 +147,10 @@ def build_parser(defaults: dict | None = None) -> argparse.ArgumentParser:
         default=defaults.get("runtime_control_file", ".runtime-control.json"),
     )
     parser.add_argument(
+        "--runtime-status-file",
+        default=defaults.get("runtime_status_file", ".runtime-status.json"),
+    )
+    parser.add_argument(
         "--effect-volume",
         type=float,
         default=defaults.get("effect_volume", 1.0),
@@ -238,6 +242,7 @@ def main() -> None:
         record_transcript=args.record_transcript,
         recordings_directory=args.recordings_directory,
         runtime_control_file=args.runtime_control_file,
+        runtime_status_file=args.runtime_status_file,
         effect_volume=args.effect_volume,
         confirmation_count=args.confirmation_count,
         stability_delay=args.stability_delay,

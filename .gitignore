@@ -7,6 +7,7 @@ models/
 recordings/
 assets/sounds/quack/
 .runtime-control.json
+.runtime-status.json
 build/
 dist/
 *.spec.bak
