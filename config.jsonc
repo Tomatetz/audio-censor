@@ -39,6 +39,12 @@
 	// Частота аудиоустройства. Для macOS, OBS и BlackHole обычно 48000.
 	"sample_rate": 48000,
 
+	// Порог активности микрофона. Настраивается мастером автокалибровки.
+	"input_activity_threshold": 0.0015,
+
+	// Папка для режима «Свои звуки». Загружаются все 16-bit PCM WAV.
+	"custom_sounds_directory": "custom_sounds",
+
 	// Модель Whisper: tiny, base, small, medium или large-v3.
 	// Чем крупнее модель, тем выше точность и нагрузка. Для начала — small.
 	"model": "small",
@@ -51,8 +57,8 @@
 
 	// Что делать с найденным словом:
 	// reverse — проиграть наоборот, beep — ПИП,
-	// bark — гавканье, meow — мяуканье, mute — заглушить.
-	"mode": "bark",
+	// bark — гавканье, meow — мяуканье, custom — свои WAV, mute — заглушить.
+	"mode": "custom",
 
 	// Частота сигнала в герцах. Используется только при mode="beep".
 	"beep_frequency": 880.0,

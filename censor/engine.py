@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import json
 import threading
@@ -15,6 +16,7 @@ import sounddevice as sd
 from faster_whisper import WhisperModel
 
 from .matcher import WordMatcher
+from .matcher import normalize_word
 from .paths import resource_root
 from .recorder import TranscriptRecorder, WavRecorder
 from .samples import SoundLibrary
@@ -53,6 +55,8 @@ class EngineConfig:
     censor_lead_ms: int = 20
     censor_tail_ms: int = 80
     crossfade_ms: int = 8
+    input_activity_threshold: float = 0.003
+    custom_sounds_directory: str = "custom_sounds"
 
 
 class CensorEngine:
@@ -73,7 +77,11 @@ class CensorEngine:
             time_tolerance=config.word_time_tolerance,
         )
         sounds_path = resource_root() / "assets" / "sounds"
-        self.sound_library = SoundLibrary(sounds_path, config.sample_rate)
+        self.sound_library = SoundLibrary(
+            sounds_path,
+            config.sample_rate,
+            custom_root=config.custom_sounds_directory,
+        )
         capacity_seconds = config.delay_seconds + config.chunk_seconds + 5
         self.capacity = round(capacity_seconds * config.sample_rate)
         self.audio = np.zeros(self.capacity, dtype=np.float32)
@@ -88,6 +96,8 @@ class CensorEngine:
         self._settings_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._status_write_lock = threading.Lock()
+        self._last_status_wall = time.monotonic()
+        self._last_status_cpu = time.process_time()
         self._runtime_status = {
             "phase": "starting",
             "model_state": "waiting",
@@ -95,11 +105,15 @@ class CensorEngine:
             "mic_rms": 0.0,
             "mic_peak": 0.0,
             "clipping": False,
+            "cpu_percent": 0.0,
+            "asr_state": "waiting",
+            "asr_duration": None,
             "last_error": None,
         }
         self.recorder: Optional[WavRecorder] = None
         self.transcript: Optional[TranscriptRecorder] = None
-        self._last_sound_variant = {"bark": -1, "meow": -1}
+        self._last_sound_variant = {"bark": -1, "meow": -1, "custom": -1}
+        self._last_stable_word_end = 0
         self.stats = {
             "censored": 0,
             "miss": 0,
@@ -108,14 +122,13 @@ class CensorEngine:
             "min_margin": None,
             "modes": {},
         }
-        self.report_path: Optional[Path] = None
 
     def current_mode(self) -> str:
         with self._mode_lock:
             return self.config.mode
 
     def set_mode(self, mode: str) -> None:
-        if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
+        if mode not in {"reverse", "beep", "bark", "meow", "custom", "mute"}:
             return
         with self._mode_lock:
             old_mode = self.config.mode
@@ -201,6 +214,9 @@ class CensorEngine:
             "risk": self.stats["risk"],
             "late": self.stats["late"],
             "min_margin": minimum,
+            "delay_seconds": self.config.delay_seconds,
+            "chunk_seconds": self.config.chunk_seconds,
+            "scan_every": self.config.scan_every,
         }
 
     def _write_runtime_status(self) -> None:
@@ -217,6 +233,20 @@ class CensorEngine:
     def _status_loop(self) -> None:
         while not self.stop_event.wait(0.25):
             try:
+                now = time.monotonic()
+                cpu_now = time.process_time()
+                wall_delta = max(0.001, now - self._last_status_wall)
+                cpu_cores = max(
+                    0.0,
+                    min(999.0, (cpu_now - self._last_status_cpu) / wall_delta * 100),
+                )
+                cpu_percent = min(100.0, cpu_cores / max(1, os.cpu_count() or 1))
+                self._last_status_wall = now
+                self._last_status_cpu = cpu_now
+                self._set_runtime_status(
+                    cpu_percent=cpu_percent,
+                    cpu_cores_used=cpu_cores / 100,
+                )
                 self._write_runtime_status()
             except OSError:
                 pass
@@ -375,7 +405,11 @@ class CensorEngine:
             start = max(0, endpoint - chunk_samples)
             chunk = self._read_audio(start, endpoint - start)
             last_endpoint = endpoint
-            if len(chunk) < self.config.sample_rate // 2 or float(np.max(np.abs(chunk))) < 0.005:
+            if (
+                len(chunk) < self.config.sample_rate // 2
+                or float(np.sqrt(np.mean(np.square(chunk))))
+                < self.config.input_activity_threshold
+            ):
                 continue
             if self.config.sample_rate != self.recognition_sample_rate:
                 output_length = round(
@@ -389,6 +423,8 @@ class CensorEngine:
                 ).astype(np.float32)
             else:
                 chunk_for_recognition = chunk
+            recognition_started = time.monotonic()
+            self._set_runtime_status(asr_state="transcribing")
             try:
                 segments, _ = self.model.transcribe(
                     chunk_for_recognition,
@@ -451,14 +487,51 @@ class CensorEngine:
                         stable_text,
                     )
                 for word in stable_words:
-                    self._handle_stable_word(word)
+                    previous_end = self._last_stable_word_end
+                    self._handle_stable_word(word, previous_end)
+                    self._last_stable_word_end = max(
+                        self._last_stable_word_end,
+                        word.end_sample,
+                    )
             except Exception as error:
                 print(f"[recognizer] {error}", flush=True)
+            finally:
+                self._set_runtime_status(
+                    asr_state="idle",
+                    asr_duration=time.monotonic() - recognition_started,
+                )
 
-    def _handle_stable_word(self, word: WordObservation) -> None:
+    def _adjusted_word_start(
+        self,
+        word: WordObservation,
+        previous_word_end: int = 0,
+    ) -> int:
+        characters = len(normalize_word(word.text))
+        if not characters:
+            return word.start_sample
+        # Whisper occasionally places the beginning of a long word too late.
+        # Estimate a conservative minimum duration, but never cross the end
+        # of the preceding confirmed word.
+        estimated_ms = min(520, max(180, characters * 55))
+        estimated_samples = round(
+            estimated_ms * self.config.sample_rate / 1000
+        )
+        desired_start = word.end_sample - estimated_samples
+        maximum_extension = round(0.3 * self.config.sample_rate)
+        adjusted = max(
+            word.start_sample - maximum_extension,
+            min(word.start_sample, desired_start),
+        )
+        return max(previous_word_end, adjusted, 0)
+
+    def _handle_stable_word(
+        self,
+        word: WordObservation,
+        previous_word_end: int = 0,
+    ) -> None:
         if not self.matcher.matches(word.text):
             return
-        word_start = word.start_sample
+        word_start = self._adjusted_word_start(word, previous_word_end)
         word_end = word.end_sample
         with self.audio_lock:
             current_endpoint = self.write_sample
@@ -539,7 +612,11 @@ class CensorEngine:
                 device="auto",
                 compute_type=self.config.compute_type,
             )
-            self._set_runtime_status(model_state="ready", audio_state="starting")
+            self._set_runtime_status(
+                model_state="ready",
+                audio_state="starting",
+                asr_state="idle",
+            )
         except Exception as error:
             self._set_runtime_status(
                 phase="error",
@@ -567,7 +644,6 @@ class CensorEngine:
         recording_directory = Path(self.config.recordings_directory)
         recording_path = recording_directory / f"processed_{timestamp}.wav"
         transcript_path = recording_directory / f"processed_{timestamp}.txt"
-        self.report_path = recording_directory / f"processed_{timestamp}.report.json"
         if self.config.record_transcript:
             self.transcript = TranscriptRecorder(transcript_path)
             self.transcript.start(
@@ -645,29 +721,3 @@ class CensorEngine:
             if self.transcript:
                 self.transcript.close()
                 print(f"Расшифровка сохранена: {self.transcript.path}", flush=True)
-            self._save_report()
-
-    def _save_report(self) -> None:
-        if not self.report_path:
-            return
-        minimum = self.stats["min_margin"]
-        if self.stats["late"]:
-            recommended = self.config.delay_seconds + 2.0
-        elif minimum is None:
-            recommended = self.config.delay_seconds
-        else:
-            recommended = self.config.delay_seconds + max(
-                0.0, self.config.safety_margin - minimum
-            )
-        report = {
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "delay": self.config.delay_seconds,
-            "recommended_delay": round(recommended, 1),
-            **self.stats,
-        }
-        self.report_path.parent.mkdir(parents=True, exist_ok=True)
-        self.report_path.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(f"Отчёт сохранён: {self.report_path}", flush=True)

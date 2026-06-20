@@ -8,6 +8,7 @@ recordings/
 assets/sounds/quack/
 .runtime-control.json
 .runtime-status.json
+assets/sounds/**/*.mp3
 build/
 dist/
 *.spec.bak

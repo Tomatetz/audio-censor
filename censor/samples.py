@@ -8,16 +8,30 @@ import numpy as np
 
 
 class SoundLibrary:
-    def __init__(self, root: str | Path, sample_rate: int):
+    target_rms = 10 ** (-18 / 20)
+    peak_limit = 10 ** (-2 / 20)
+
+    def __init__(
+        self,
+        root: str | Path,
+        sample_rate: int,
+        custom_root: str | Path | None = None,
+    ):
         self.root = Path(root)
         self.sample_rate = sample_rate
+        self.custom_root = Path(custom_root) if custom_root else None
         self.sounds: Dict[str, List[np.ndarray]] = {
             "bark": self._load_kind("bark"),
             "meow": self._load_kind("meow"),
+            "custom": self._load_kind("custom"),
         }
 
     def _load_kind(self, kind: str) -> List[np.ndarray]:
-        return [self._load_wav(path) for path in sorted((self.root / kind).glob("*.wav"))]
+        paths = list((self.root / kind).glob("*.wav"))
+        if kind == "custom" and self.custom_root:
+            self.custom_root.mkdir(parents=True, exist_ok=True)
+            paths.extend(self.custom_root.glob("*.wav"))
+        return [self._load_wav(path) for path in sorted(set(paths))]
 
     def _load_wav(self, path: Path) -> np.ndarray:
         with wave.open(str(path), "rb") as audio:
@@ -38,7 +52,25 @@ class SoundLibrary:
                 np.arange(len(samples)),
                 samples,
             ).astype(np.float32)
-        return samples
+        return self._normalize(samples)
+
+    def _normalize(self, samples: np.ndarray) -> np.ndarray:
+        samples = np.asarray(samples, dtype=np.float32)
+        if not len(samples):
+            return samples
+        peak = float(np.max(np.abs(samples)))
+        if peak < 1e-6:
+            return samples
+        # Measure only the audible part so leading/trailing silence does not
+        # make short effects much louder than longer animal sounds.
+        active = np.abs(samples) >= max(0.003, peak * 0.04)
+        if not np.any(active):
+            return samples
+        rms = float(np.sqrt(np.mean(np.square(samples[active]))))
+        if rms < 1e-6:
+            return samples
+        gain = min(self.target_rms / rms, self.peak_limit / peak)
+        return (samples * gain).astype(np.float32)
 
     def count(self, kind: str) -> int:
         return len(self.sounds.get(kind, ()))
@@ -57,6 +89,9 @@ class SoundLibrary:
         source = choices[variant % len(choices)]
         if len(source) >= total_samples:
             fitted = source[:total_samples]
+        elif kind == "custom":
+            fitted = np.zeros(total_samples, dtype=np.float32)
+            fitted[: len(source)] = source
         else:
             repeats = (total_samples + len(source) - 1) // len(source)
             fitted = np.tile(source, repeats)[:total_samples]

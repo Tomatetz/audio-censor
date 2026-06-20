@@ -99,7 +99,7 @@ def build_parser(defaults: dict | None = None) -> argparse.ArgumentParser:
     parser.add_argument("--language", default=defaults.get("language", "ru"))
     parser.add_argument(
         "--mode",
-        choices=("reverse", "beep", "bark", "meow", "mute"),
+        choices=("reverse", "beep", "bark", "meow", "custom", "mute"),
         default=defaults.get("mode", "reverse"),
     )
     parser.add_argument(
@@ -185,6 +185,15 @@ def build_parser(defaults: dict | None = None) -> argparse.ArgumentParser:
         type=int,
         default=defaults.get("crossfade_ms", 8),
     )
+    parser.add_argument(
+        "--input-activity-threshold",
+        type=float,
+        default=defaults.get("input_activity_threshold", 0.003),
+    )
+    parser.add_argument(
+        "--custom-sounds-directory",
+        default=defaults.get("custom_sounds_directory", "custom_sounds"),
+    )
     parser.add_argument("--words", default=defaults.get("words", "words.txt"))
     return parser
 
@@ -250,6 +259,8 @@ def main() -> None:
         censor_lead_ms=args.censor_lead_ms,
         censor_tail_ms=args.censor_tail_ms,
         crossfade_ms=args.crossfade_ms,
+        input_activity_threshold=args.input_activity_threshold,
+        custom_sounds_directory=args.custom_sounds_directory,
     )
     print(f"Настройки загружены из: {args.config}")
     engine = CensorEngine(config, WordMatcher.from_file(args.words))

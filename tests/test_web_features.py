@@ -28,34 +28,6 @@ class WebFeaturesTests(unittest.TestCase):
                 self.assertEqual(audio.getframerate(), 48000)
                 self.assertGreater(audio.getnframes(), 1000)
 
-    def test_report_recommends_more_delay_after_late_event(self):
-        with tempfile.TemporaryDirectory() as directory:
-            engine = CensorEngine(
-                EngineConfig(
-                    input_device=None,
-                    output_device=None,
-                    delay_seconds=5,
-                ),
-                WordMatcher([]),
-            )
-            engine.report_path = Path(directory) / "report.json"
-            engine.stats["late"] = 1
-            engine._save_report()
-            report = json.loads(engine.report_path.read_text(encoding="utf-8"))
-            self.assertEqual(report["recommended_delay"], 7.0)
-
-    def test_reads_latest_report(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            older = root / "a.report.json"
-            newer = root / "b.report.json"
-            older.write_text('{"censored": 1}', encoding="utf-8")
-            newer.write_text('{"censored": 2}', encoding="utf-8")
-            older.touch()
-            newer.touch()
-            with patch.object(web_gui, "RECORDINGS", root):
-                self.assertEqual(web_gui.latest_report()["censored"], 2)
-
     def test_marks_stale_runtime_status_as_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -87,16 +59,55 @@ class WebFeaturesTests(unittest.TestCase):
         self.assertIn('class="panel cluster-panel"', web_gui.HTML)
         self.assertIn('id="mic_segments"', web_gui.HTML)
         self.assertIn('id="risk_lamp"', web_gui.HTML)
-        self.assertIn('mini-log display-panel', web_gui.HTML)
+        self.assertIn('id="delay_track"', web_gui.HTML)
+        self.assertIn('id="cpu_meter"', web_gui.HTML)
+        self.assertIn('@keyframes modelBoot', web_gui.HTML)
+        self.assertIn('.cluster-side { display:grid; grid-template-columns:1fr 1fr;', web_gui.HTML)
+        self.assertIn('class="telemetry-cell"><div class="system-label">WHISPER CPU', web_gui.HTML)
+        self.assertIn('.system-cell { min-height:45px;', web_gui.HTML)
+        self.assertIn('id="diagnostics_dialog"', web_gui.HTML)
+        self.assertIn('async function startCalibration()', web_gui.HTML)
+        self.assertIn('async function openCustomSounds()', web_gui.HTML)
+        self.assertIn('value="custom"', web_gui.HTML)
+        self.assertNotIn('id="report"', web_gui.HTML)
+        self.assertNotIn('<h2 data-i18n="advanced">', web_gui.HTML)
+        self.assertNotIn('data-i18n="save_settings"', web_gui.HTML)
+        self.assertIn('function enableAutosave()', web_gui.HTML)
+        self.assertIn('class="help-tip"', web_gui.HTML)
         self.assertIn('panel display-panel', web_gui.HTML)
+        self.assertIn('class="cluster-log"><pre id="log"', web_gui.HTML)
+        self.assertIn('class="cluster-log-title" data-i18n="log">ЖУРНАЛ', web_gui.HTML)
+        self.assertIn('<select id="language">', web_gui.HTML)
+        self.assertIn('value="en">EN — English', web_gui.HTML)
         self.assertIn('h1::before { content:"SC-86 // "', web_gui.HTML)
         self.assertIn('.check input:checked', web_gui.HTML)
         self.assertIn('function enhanceSelect(select)', web_gui.HTML)
         self.assertIn('className="custom-select-option"', web_gui.HTML)
+        self.assertIn("onclick=\"setUILanguage('ru')\"", web_gui.HTML)
+        self.assertIn("localStorage.setItem(\"stream-censor-ui-language\"", web_gui.HTML)
+        self.assertIn('document.querySelector("#censored_count").textContent="0"', web_gui.HTML)
         self.assertLess(
-            web_gui.HTML.index('<div class="mini-log display-panel"><h2>Журнал</h2>'),
-            web_gui.HTML.index('class="panel cluster-panel"'),
+            web_gui.HTML.index('STREAM CENSOR / DIGITAL'),
+            web_gui.HTML.index('class="cluster-log-title" data-i18n="log">ЖУРНАЛ'),
         )
+
+    def test_analyzes_healthy_microphone_calibration(self):
+        result = web_gui.analyze_calibration(
+            [0.0005] * 20,
+            [0.08] * 20,
+            [0.3] * 20,
+        )
+        self.assertEqual(result["rating"], "green")
+        self.assertGreater(result["snr_db"], 20)
+        self.assertGreater(result["threshold"], 0.001)
+
+    def test_calibration_detects_clipping(self):
+        result = web_gui.analyze_calibration(
+            [0.001] * 20,
+            [0.2] * 20,
+            [1.0],
+        )
+        self.assertEqual(result["rating"], "red")
 
 
 if __name__ == "__main__":

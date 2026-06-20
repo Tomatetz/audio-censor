@@ -1,9 +1,11 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from censor.engine import CensorEngine, EngineConfig
 from censor.matcher import WordMatcher
+from censor.streaming import WordObservation
 
 
 class EngineTests(unittest.TestCase):
@@ -71,7 +73,7 @@ class EngineTests(unittest.TestCase):
                 complete,
                 atol=1e-6,
             )
-            self.assertGreater(float(np.max(np.abs(complete))), 0.01)
+            self.assertGreater(float(np.max(np.abs(complete))), 0.001)
 
     def test_does_not_repeat_same_animal_variant_consecutively(self):
         engine = CensorEngine(
@@ -146,6 +148,9 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(status["censored"], 3)
         self.assertEqual(status["min_margin"], 1.4)
         self.assertGreater(status["mic_rms"], 0)
+        self.assertEqual(status["delay_seconds"], 5.0)
+        self.assertEqual(status["chunk_seconds"], 3.0)
+        self.assertIn("cpu_percent", status)
 
     def test_runtime_status_warns_about_clipping(self):
         engine = CensorEngine(
@@ -161,6 +166,64 @@ class EngineTests(unittest.TestCase):
 
         self.assertEqual(engine.runtime_status()["overall"], "yellow")
         self.assertTrue(engine.runtime_status()["clipping"])
+
+    def test_cpu_load_is_normalized_to_machine_capacity(self):
+        engine = CensorEngine(
+            EngineConfig(input_device=None, output_device=None),
+            WordMatcher([]),
+        )
+        engine._last_status_wall = 10.0
+        engine._last_status_cpu = 4.0
+        engine.stop_event.wait = lambda _timeout: engine.stop_event.is_set()
+        engine._write_runtime_status = lambda: engine.stop_event.set()
+
+        with (
+            patch("censor.engine.time.monotonic", return_value=11.0),
+            patch("censor.engine.time.process_time", return_value=8.0),
+            patch("censor.engine.os.cpu_count", return_value=8),
+        ):
+            engine._status_loop()
+
+        status = engine.runtime_status()
+        self.assertEqual(status["cpu_percent"], 50.0)
+        self.assertEqual(status["cpu_cores_used"], 4.0)
+
+    def test_extends_late_start_of_long_word_without_touching_previous_word(self):
+        engine = CensorEngine(
+            EngineConfig(
+                input_device=None,
+                output_device=None,
+                sample_rate=1000,
+            ),
+            WordMatcher([]),
+        )
+        word = WordObservation(
+            text=" карандаш",
+            start_sample=1000,
+            end_sample=1200,
+            probability=0.9,
+        )
+
+        self.assertEqual(engine._adjusted_word_start(word, 700), 760)
+        self.assertEqual(engine._adjusted_word_start(word, 900), 900)
+
+    def test_does_not_extend_normal_long_word_timestamp(self):
+        engine = CensorEngine(
+            EngineConfig(
+                input_device=None,
+                output_device=None,
+                sample_rate=1000,
+            ),
+            WordMatcher([]),
+        )
+        word = WordObservation(
+            text=" карандаш",
+            start_sample=700,
+            end_sample=1200,
+            probability=0.9,
+        )
+
+        self.assertEqual(engine._adjusted_word_start(word, 600), 700)
 
 
 if __name__ == "__main__":

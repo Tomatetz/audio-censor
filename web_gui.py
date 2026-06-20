@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -35,6 +36,7 @@ APP_PATH = RESOURCE_ROOT / "app.py"
 TEST_SCRIPT = ROOT / "test_script.txt"
 WORDS_PATH = ROOT / "words.txt"
 RECORDINGS = ROOT / "recordings"
+CUSTOM_SOUNDS = ROOT / "custom_sounds"
 HOST = "127.0.0.1"
 PORT = 8765
 MAX_PORT_ATTEMPTS = 10
@@ -75,7 +77,7 @@ def update_jsonc(path: Path, values: dict) -> None:
 
 
 def write_runtime_settings(mode: str, effect_volume: float) -> None:
-    if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
+    if mode not in {"reverse", "beep", "bark", "meow", "custom", "mute"}:
         raise ValueError("Неизвестный режим обработки.")
     config = load_config(DEFAULT_CONFIG)
     path = ROOT / config.get("runtime_control_file", ".runtime-control.json")
@@ -114,8 +116,12 @@ def preview_wav(mode: str, volume: float, sample_rate: int = 48000) -> bytes:
     if mode == "beep":
         positions = np.arange(count, dtype=np.float32)
         samples = 0.18 * np.sin(2 * np.pi * 880 * positions / sample_rate)
-    elif mode in {"bark", "meow"}:
-        library = SoundLibrary(RESOURCE_ROOT / "assets" / "sounds", sample_rate)
+    elif mode in {"bark", "meow", "custom"}:
+        library = SoundLibrary(
+            RESOURCE_ROOT / "assets" / "sounds",
+            sample_rate,
+            custom_root=CUSTOM_SOUNDS,
+        )
         samples = library.part(mode, 0, 0, count, count)
     elif mode == "mute":
         samples = np.zeros(count, dtype=np.float32)
@@ -136,11 +142,43 @@ def preview_wav(mode: str, volume: float, sample_rate: int = 48000) -> bytes:
     return buffer.getvalue()
 
 
-def latest_report() -> dict | None:
-    reports = sorted(RECORDINGS.glob("*.report.json"), key=lambda path: path.stat().st_mtime)
-    if not reports:
-        return None
-    return json.loads(reports[-1].read_text(encoding="utf-8"))
+def amplitude_db(value: float) -> float:
+    return 20 * np.log10(max(float(value), 1e-6))
+
+
+def analyze_calibration(
+    silence_levels: list[float],
+    speech_levels: list[float],
+    speech_peaks: list[float],
+) -> dict:
+    if not silence_levels or not speech_levels:
+        raise ValueError("Недостаточно данных для калибровки.")
+    noise = float(np.percentile(silence_levels, 80))
+    speech = float(np.percentile(speech_levels, 70))
+    peak = max(speech_peaks or [0.0])
+    snr = amplitude_db(speech) - amplitude_db(noise)
+    threshold = min(0.05, max(0.0015, noise * 2.5))
+    if peak >= 0.98:
+        rating = "red"
+        message = "Микрофон перегружен — уменьшите усиление."
+    elif snr < 10:
+        rating = "yellow"
+        message = "Речь близка к шумовому фону."
+    elif amplitude_db(speech) < -32:
+        rating = "yellow"
+        message = "Речь тихая — приблизьте микрофон или добавьте усиление."
+    else:
+        rating = "green"
+        message = "Уровень микрофона хороший."
+    return {
+        "noise_db": round(amplitude_db(noise), 1),
+        "speech_db": round(amplitude_db(speech), 1),
+        "peak_db": round(amplitude_db(peak), 1),
+        "snr_db": round(snr, 1),
+        "threshold": round(threshold, 6),
+        "rating": rating,
+        "message": message,
+    }
 
 
 def runtime_status() -> dict | None:
@@ -212,7 +250,112 @@ class AppState:
             return "".join(self.logs)
 
 
+class DiagnosticsState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.data = {"state": "idle", "phase": None, "result": None, "error": None}
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return dict(self.data)
+
+    def _set(self, **values) -> None:
+        with self.lock:
+            self.data.update(values)
+
+    def start_calibration(self, input_device: int | None, sample_rate: int) -> None:
+        if self.snapshot()["state"] == "running":
+            raise ValueError("Диагностика уже выполняется.")
+        self._set(state="running", phase="silence", result=None, error=None)
+        threading.Thread(
+            target=self._calibrate,
+            args=(input_device, sample_rate),
+            daemon=True,
+        ).start()
+
+    def _calibrate(self, input_device: int | None, sample_rate: int) -> None:
+        silence: list[float] = []
+        speech: list[float] = []
+        peaks: list[float] = []
+        started = time.monotonic()
+
+        def callback(indata, _frames, _time_info, status) -> None:
+            if status:
+                self._set(error=str(status))
+            samples = np.asarray(indata[:, 0], dtype=np.float32)
+            rms = float(np.sqrt(np.mean(np.square(samples))))
+            peak = float(np.max(np.abs(samples)))
+            elapsed = time.monotonic() - started
+            if elapsed < 2.5:
+                silence.append(rms)
+                self._set(phase="silence", progress=min(0.4, elapsed / 6.5))
+            else:
+                speech.append(rms)
+                peaks.append(peak)
+                self._set(phase="speech", progress=min(1.0, elapsed / 6.5))
+
+        try:
+            with sd.InputStream(
+                device=input_device,
+                samplerate=sample_rate,
+                channels=1,
+                dtype="float32",
+                callback=callback,
+            ):
+                time.sleep(6.5)
+            result = analyze_calibration(silence, speech, peaks)
+            update_jsonc(
+                DEFAULT_CONFIG,
+                {"input_activity_threshold": result["threshold"]},
+            )
+            self._set(state="complete", phase="complete", progress=1.0, result=result)
+        except Exception as error:
+            self._set(state="error", phase="error", error=str(error))
+
+    def start_route_test(self, output_device: int | None, sample_rate: int) -> None:
+        if output_device is None:
+            raise ValueError("Выберите устройство вывода для проверки маршрута.")
+        if self.snapshot()["state"] == "running":
+            raise ValueError("Диагностика уже выполняется.")
+        self._set(state="running", phase="route", progress=0.0, result=None, error=None)
+        threading.Thread(
+            target=self._route_test,
+            args=(output_device, sample_rate),
+            daemon=True,
+        ).start()
+
+    def _route_test(self, output_device: int, sample_rate: int) -> None:
+        try:
+            duration = 0.32
+            count = round(sample_rate * duration)
+            position = np.arange(count, dtype=np.float32)
+            fade = np.minimum(np.linspace(0, 1, count), np.linspace(1, 0, count))
+            silence = np.zeros(round(sample_rate * 0.18), dtype=np.float32)
+            parts = []
+            for index, frequency in enumerate((440, 660, 880), 1):
+                tone = 0.16 * np.sin(2 * np.pi * frequency * position / sample_rate)
+                parts.extend((tone * np.minimum(1.0, fade * 12), silence))
+                self._set(progress=index / 3)
+            samples = np.concatenate(parts).astype(np.float32)
+            with sd.OutputStream(
+                device=output_device,
+                samplerate=sample_rate,
+                channels=1,
+                dtype="float32",
+            ) as stream:
+                stream.write(samples.reshape(-1, 1))
+            self._set(
+                state="complete",
+                phase="route_complete",
+                progress=1.0,
+                result={"rating": "green", "message": "Тестовый сигнал отправлен."},
+            )
+        except Exception as error:
+            self._set(state="error", phase="error", error=str(error))
+
+
 STATE = AppState()
+DIAGNOSTICS = DiagnosticsState()
 SERVER: ThreadingHTTPServer | None = None
 
 
@@ -273,6 +416,12 @@ h1::before { content:"SC-86 // "; color:#ffcc61; font-size:10px; vertical-align:
 #status { padding:6px 10px; border:1px solid #315b4b; color:#6ccba5;
   background:#07110d; font-size:10px; letter-spacing:.08em; text-transform:uppercase;
   box-shadow:inset 0 0 10px #000 }
+.header-tools { display:flex; align-items:center; gap:9px }
+.locale-switch { display:flex; padding:3px; border:1px solid #315b4b; background:#07110d }
+.locale-switch button { min-width:38px; padding:5px 7px; border:0; box-shadow:none;
+  color:#4f8c74; background:transparent }
+.locale-switch button.active { color:#07150f; background:#55efaa; text-shadow:none;
+  box-shadow:0 0 7px rgba(70,239,165,.35) }
 main { display:grid; grid-template-columns:330px 1fr; gap:14px; padding:14px;
   height:calc(100vh - 60px); }
 .panel { min-height:0; padding:16px; border:1px solid #3c584c; border-radius:5px;
@@ -349,10 +498,18 @@ button:disabled { opacity:.35; cursor:default; filter:grayscale(.5) }
 .report { margin-top:12px; padding:10px; border:1px solid #315b4b; border-radius:2px;
   color:#63ae90; background:#07110d; line-height:1.5; font-size:10px;
   box-shadow:inset 0 0 12px #000 }
-.mini-log { height:190px; margin-top:14px }
-.mini-log pre { height:calc(100% - 28px); padding:10px; font-size:10px }
+.diagnostic-status { padding:12px; border:1px solid #315b4b; background:#06110d;
+  color:#76dcb5; line-height:1.6; min-height:100px; box-shadow:inset 0 0 14px #000 }
+.diagnostic-status.green { border-color:#55efaa }.diagnostic-status.yellow { border-color:#ffc84d;color:#ffd778 }
+.diagnostic-status.red { border-color:#ff6257;color:#ff8178 }
+.diagnostic-progress { height:10px; margin:10px 0; border:1px solid #315b4b; background:#07110d }
+.diagnostic-progress i { display:block; width:0; height:100%; background:#55efaa;
+  box-shadow:0 0 7px #3cff9c; transition:width .2s ease }
+.diagnostic-values { display:grid; grid-template-columns:repeat(4,1fr); gap:7px; margin-top:10px }
+.diagnostic-value { padding:8px; border:1px solid #244b3d; text-align:center }
+.diagnostic-value b { display:block; margin-top:4px; color:#ffcc61 }
 .cluster-panel { padding:12px; overflow:hidden }
-.cluster { position:relative; height:100%; min-height:260px; padding:20px 22px 18px;
+.cluster { position:relative; height:100%; min-height:260px; padding:14px 18px 12px;
   overflow:hidden; border:2px solid #4b514f; border-radius:8px 8px 26px 26px;
   color:#8dffd1; background:
     repeating-linear-gradient(0deg,rgba(255,255,255,.025) 0 1px,transparent 1px 4px),
@@ -360,9 +517,15 @@ button:disabled { opacity:.35; cursor:default; filter:grayscale(.5) }
   box-shadow:inset 0 0 0 4px #0a0d0c,inset 0 0 38px #000,0 0 0 1px #101311 }
 .cluster::after { content:""; position:absolute; inset:0; pointer-events:none;
   background:linear-gradient(105deg,transparent 0 42%,rgba(185,255,225,.055) 47%,transparent 53%) }
-.cluster-top { position:relative; z-index:1; display:flex; align-items:center;
-  justify-content:space-between; padding-bottom:11px; border-bottom:1px solid #315b4b }
+.cluster-top { position:relative; z-index:1; display:grid;
+  grid-template-columns:minmax(0,1.15fr) minmax(155px,.55fr) minmax(220px,.7fr);
+  gap:16px;
+  align-items:center; padding-bottom:8px; border-bottom:1px solid #315b4b }
 .cluster-title { color:#67cda8; font:11px Menlo,monospace; letter-spacing:.24em }
+.cluster-log-title { color:#67cda8; font:10px Menlo,monospace; letter-spacing:.18em;
+  text-align:left }
+.cluster-log-title::before { content:"■"; margin-right:7px; color:#4cffaa;
+  text-shadow:0 0 7px #3cff9c }
 .health { display:inline-flex; align-items:center; gap:8px; color:#749589;
   font:700 12px Menlo,monospace; letter-spacing:.08em; text-transform:uppercase }
 .health::before { content:""; width:10px; height:10px; border-radius:2px;
@@ -371,39 +534,75 @@ button:disabled { opacity:.35; cursor:default; filter:grayscale(.5) }
 .health.yellow { color:#ffd36d }.health.yellow::before { background:#ffc64a;box-shadow:0 0 9px #ffb82e }
 .health.red { color:#ff7b72 }.health.red::before { background:#ff5148;box-shadow:0 0 10px #ff3b30 }
 .cluster-main { position:relative; z-index:1; display:grid;
-  grid-template-columns:minmax(0,1.25fr) minmax(170px,.75fr); gap:22px;
-  align-items:stretch; height:calc(100% - 44px); padding-top:15px }
+  grid-template-columns:minmax(0,1.15fr) minmax(155px,.55fr) minmax(220px,.7fr);
+  gap:16px;
+  align-items:stretch; height:calc(100% - 35px); padding-top:10px }
 .voice-gauge { display:flex; flex-direction:column; justify-content:space-between; min-width:0 }
 .gauge-caption { display:flex; justify-content:space-between; color:#4e9279;
   font:10px Menlo,monospace; letter-spacing:.16em }
 .segment-track { display:grid; grid-template-columns:repeat(20,1fr); gap:4px;
-  height:38px; margin:8px 0 5px }
-.segment { align-self:end; height:18px; clip-path:polygon(12% 0,88% 0,100% 20%,100% 80%,88% 100%,12% 100%,0 80%,0 20%);
+  height:28px; margin:5px 0 2px }
+.segment { align-self:end; height:14px; clip-path:polygon(12% 0,88% 0,100% 20%,100% 80%,88% 100%,12% 100%,0 80%,0 20%);
   background:#17382e; box-shadow:inset 0 0 0 1px #285446 }
 .segment.lit { background:#55efaa; box-shadow:0 0 8px rgba(77,255,176,.72) }
 .segment.warn.lit { background:#ffc84d; box-shadow:0 0 8px rgba(255,190,50,.8) }
 .segment.danger.lit { background:#ff5d50; box-shadow:0 0 9px rgba(255,60,45,.85) }
 .db-row { display:flex; align-items:baseline; gap:10px }
-.digital { color:#91ffd4; font:700 42px "Arial Narrow",Menlo,monospace;
+.digital { color:#91ffd4; font:700 29px "Arial Narrow",Menlo,monospace;
   letter-spacing:.04em; line-height:1; text-shadow:0 0 9px rgba(74,255,181,.6) }
 .digital small { font-size:12px; color:#4e9279; letter-spacing:.12em }
-.system-grid { display:grid; grid-template-columns:1fr 1fr; gap:9px; margin-top:14px }
-.system-cell { padding:8px 10px; border:1px solid #244b3d; background:rgba(5,24,18,.65) }
+.system-grid { display:grid; grid-template-columns:1fr 1fr; gap:7px; margin-top:8px }
+.system-cell { min-height:45px; padding:6px 9px; border:1px solid #244b3d; background:rgba(5,24,18,.65) }
 .system-label { color:#4d8a73; font:9px Menlo,monospace; letter-spacing:.13em }
-.system-value { margin-top:3px; overflow:hidden; color:#76dcb5; font:12px Menlo,monospace;
+.system-value { margin-top:2px; overflow:hidden; color:#76dcb5; font:11px Menlo,monospace;
   text-overflow:ellipsis; white-space:nowrap }
-.cluster-side { display:grid; grid-template-rows:1fr 1fr auto; gap:10px }
-.readout { display:flex; flex-direction:column; justify-content:center; padding:10px;
-  border:1px solid #315b4b; background:rgba(3,18,13,.72); text-align:center }
+.system-value.model-loading { color:#ffd05d; overflow:visible }
+.system-value.model-loading::after { content:" ▰ ▰ ▰"; display:inline-block; width:1.4em;
+  overflow:hidden; vertical-align:bottom; white-space:nowrap;
+  animation:modelBoot 1s steps(3,end) infinite; text-shadow:0 0 7px #ffbd35 }
+@keyframes modelBoot { from{width:1.4em;opacity:.55} to{width:4.4em;opacity:1} }
+.delay-module { margin-top:7px; padding:6px 9px; border:1px solid #244b3d;
+  background:rgba(5,24,18,.65) }
+.delay-head { display:flex; justify-content:space-between; color:#4d8a73;
+  font:9px Menlo,monospace; letter-spacing:.12em }
+.delay-track { position:relative; height:17px; margin:5px 0 3px; overflow:hidden;
+  border:1px solid #315b4b; background:#07110d }
+.delay-safe { position:absolute; inset:0; background:linear-gradient(90deg,#174431,#0d291f) }
+.delay-asr { position:absolute; top:0; right:0; bottom:0; width:43%;
+  border-left:1px solid #c79737; background:rgba(183,126,28,.24) }
+.delay-pulse { position:absolute; z-index:2; top:3px; right:3px; width:9px; height:9px;
+  border:2px solid #9effd2; background:#43e89e; box-shadow:0 0 9px #3cff9c;
+  animation:delayTravel 7s linear infinite }
+.delay-track.paused .delay-pulse { display:none }
+@keyframes delayTravel { from{right:3px} to{right:calc(100% - 12px)} }
+.delay-labels { display:flex; justify-content:space-between; color:#3e8067;
+  font:8px Menlo,monospace; letter-spacing:.08em }
+.cpu-meter { height:5px; margin-top:5px; overflow:hidden; background:#10271e }
+.cpu-meter i { display:block; width:0; height:100%; background:#55efaa;
+  box-shadow:0 0 6px #3cff9c; transition:width .25s ease }
+.cluster-side { display:grid; grid-template-columns:1fr 1fr;
+  grid-template-rows:auto auto auto; gap:8px; align-content:start }
+.readout { display:flex; min-height:58px; flex-direction:column; justify-content:center;
+  padding:8px 9px; border:1px solid #315b4b;
+  background:rgba(3,18,13,.72); text-align:center }
 .readout-label { color:#4d8a73; font:9px Menlo,monospace; letter-spacing:.16em }
-.readout-value { margin-top:5px; color:#ffce62; font:700 34px Menlo,monospace;
+.readout-value { margin-top:4px; color:#ffce62; font:700 24px Menlo,monospace;
   line-height:1; text-shadow:0 0 9px rgba(255,190,50,.5) }
 .readout-value small { font-size:11px; color:#907b48 }
-.warning-lamps { display:grid; grid-template-columns:repeat(3,1fr); gap:6px }
+.warning-lamps { grid-column:1/-1; display:grid; grid-template-columns:repeat(3,1fr); gap:6px }
+.telemetry-cell { min-height:48px; padding:7px 9px; border:1px solid #244b3d;
+  background:rgba(5,24,18,.65) }
+.telemetry-cell .system-value { margin-top:2px; font-size:11px }
 .lamp { padding:7px 4px; border:1px solid #293b35; color:#455b54;
   background:#101713; font:700 9px Menlo,monospace; text-align:center }
 .lamp.on-yellow { color:#ffd15e; border-color:#8a6922; box-shadow:inset 0 0 12px #5e430f }
 .lamp.on-red { color:#ff7168; border-color:#8d302c; box-shadow:inset 0 0 12px #5f1714 }
+.cluster-log { position:relative; min-width:0; min-height:0; overflow:hidden;
+  border:1px solid #315b4b; background:#06110d; box-shadow:inset 0 0 18px #000 }
+.cluster-log::after { content:""; position:absolute; inset:0; z-index:2; pointer-events:none;
+  background:repeating-linear-gradient(0deg,transparent 0 3px,rgba(94,255,177,.025) 3px 4px) }
+.cluster-log pre { position:relative; z-index:1; height:100%; padding:10px;
+  border:0; border-radius:0; font-size:9px; line-height:1.45; box-shadow:none }
 dialog { width:min(720px,90vw); padding:18px; border:2px solid #426d59;
   border-radius:4px 4px 18px 4px; color:var(--text);
   background:linear-gradient(135deg,#1b2822,#0a100d);
@@ -414,6 +613,15 @@ dialog textarea { width:100%; min-height:340px; resize:vertical; padding:12px;
   font:12px Menlo,Monaco,monospace; text-shadow:0 0 5px rgba(83,255,181,.3) }
 .advanced-grid { display:grid; grid-template-columns:1fr 1fr; gap:0 18px }
 .advanced-grid .wide { grid-column:1 / -1 }
+.help-tip { position:relative; display:inline-flex; width:15px; height:15px;
+  margin-left:5px; align-items:center; justify-content:center; border:1px solid #4a8068;
+  border-radius:50%; color:#ffcc61; font-size:9px; cursor:help; vertical-align:1px }
+.help-tip::after { content:attr(data-tooltip); position:absolute; z-index:100;
+  left:50%; bottom:calc(100% + 8px); display:none; width:260px; padding:9px 10px;
+  border:1px solid #4b8068; color:#91e9c4; background:#06110d;
+  font:10px/1.45 Menlo,Monaco,monospace; letter-spacing:0; text-transform:none;
+  transform:translateX(-50%); box-shadow:0 8px 22px #000,inset 0 0 12px #000 }
+.help-tip:hover::after,.help-tip:focus::after { display:block }
 .display-panel { position:relative; overflow:hidden; padding:12px;
   border-color:#344b43; background:#111715 }
 .display-panel::after { content:""; position:absolute; inset:40px 12px 12px;
@@ -444,44 +652,51 @@ pre::-webkit-scrollbar-thumb,.script::-webkit-scrollbar-thumb {
 .controls::-webkit-scrollbar-track,dialog textarea::-webkit-scrollbar-track { background:#09100d }
 .controls::-webkit-scrollbar-thumb,dialog textarea::-webkit-scrollbar-thumb {
   border:2px solid #09100d; background:#396b55 }
+@media(max-width:1100px){
+  .cluster-top{grid-template-columns:1fr auto}.cluster-log-title{display:none}
+  .cluster-main{grid-template-columns:minmax(0,1fr) minmax(155px,.55fr)}
+  .cluster-log{grid-column:1/-1;min-height:130px}
+}
 @media(max-width:950px){.cluster-main{grid-template-columns:1fr}.cluster-side{grid-template-columns:1fr 1fr;grid-template-rows:auto}.warning-lamps{grid-column:1/-1}}
 @media(max-width:800px){ main{grid-template-columns:1fr;height:auto}.right{height:900px}.cluster{min-height:430px} }
 </style>
 </head>
 <body>
-<header><h1>Stream Censor</h1><div id="status">Загрузка…</div></header>
+<header><h1>Stream Censor</h1><div class="header-tools"><div id="status">Загрузка…</div><div class="locale-switch"><button id="ui_ru" onclick="setUILanguage('ru')">RU</button><button id="ui_en" onclick="setUILanguage('en')">EN</button></div></div></header>
 <main>
   <section class="panel controls">
-    <h2>Настройки</h2>
-    <label>Микрофон</label><select id="input_device"></select>
-    <label>Вывод</label><select id="output_device"></select>
-    <label>Обработка — меняется на лету</label><div class="inline"><select id="mode" onchange="changeRuntimeSettings()">
-      <option value="reverse">Проиграть наоборот</option>
-      <option value="beep">ПИП</option>
-      <option value="bark">Гавканье</option>
-      <option value="meow">Мяуканье</option>
-      <option value="mute">Заглушить</option>
+    <h2 data-i18n="settings">Настройки</h2>
+    <label data-i18n="microphone">Микрофон</label><select id="input_device"></select>
+    <label data-i18n="output">Вывод</label><select id="output_device"></select>
+    <label data-i18n="speech_language">Язык речи</label><select id="language">
+      <option value="ru">РУ — Русский</option>
+      <option value="en">EN — English</option>
+    </select>
+    <label data-i18n="processing">Обработка — меняется на лету</label><div class="inline"><select id="mode" onchange="changeRuntimeSettings()">
+      <option value="reverse" data-i18n-option="reverse">Проиграть наоборот</option>
+      <option value="beep" data-i18n-option="beep">ПИП</option>
+      <option value="bark" data-i18n-option="bark">Гавканье</option>
+      <option value="meow" data-i18n-option="meow">Мяуканье</option>
+      <option value="custom" data-i18n-option="custom">Свои звуки</option>
+      <option value="mute" data-i18n-option="mute">Заглушить</option>
     </select><button onclick="previewEffect()">▶</button></div>
-    <label>Громкость эффекта</label><div class="volume"><input id="effect_volume" type="range" min="0" max="2" step="0.05" oninput="volume_value.value=this.value" onchange="changeRuntimeSettings()"><output id="volume_value">1.0</output></div>
+    <label data-i18n="effect_volume">Громкость эффекта</label><div class="volume"><input id="effect_volume" type="range" min="0" max="2" step="0.05" oninput="volume_value.value=this.value" onchange="changeRuntimeSettings()"><output id="volume_value">1.0</output></div>
     <div class="buttons">
-      <button id="start" class="primary" onclick="startApp()">▶ Запустить</button>
-      <button id="stop" class="stop" onclick="stopApp()">■ Остановить</button>
+      <button id="start" class="primary" onclick="startApp()" data-i18n="start">▶ Запустить</button>
+      <button id="stop" class="stop" onclick="stopApp()" data-i18n="stop">■ Остановить</button>
     </div>
-    <div class="mini-log display-panel"><h2>Журнал</h2><pre id="log"></pre></div>
-    <button class="full" onclick="save()">Сохранить настройки</button>
-    <button class="full" onclick="document.querySelector('#advanced_dialog').showModal()">Расширенные настройки</button>
-    <button class="full" onclick="openWords()">Редактировать словарь</button>
-    <button class="full" onclick="openRecordings()">Открыть папку записей</button>
-    <div id="report" class="report">Отчётов пока нет.</div>
-    <button class="danger" onclick="closeApp()">Закрыть приложение</button>
+    <button class="full" onclick="document.querySelector('#advanced_dialog').showModal()" data-i18n="advanced">Расширенные настройки</button>
+    <button class="full" onclick="openDiagnostics()" data-i18n="diagnostics">Калибровка и аудиомаршрут</button>
+    <button class="danger" onclick="closeApp()" data-i18n="close_app">Закрыть приложение</button>
   </section>
   <section class="right">
-    <div class="panel display-panel"><h2>Текст для проверки</h2><div id="script" class="script"></div></div>
+    <div class="panel display-panel"><h2 data-i18n="test_text">Текст для проверки</h2><div id="script" class="script"></div></div>
     <div class="panel cluster-panel">
       <div class="cluster">
         <div class="cluster-top">
           <span class="cluster-title">STREAM CENSOR / DIGITAL</span>
           <span id="health" class="health">Ожидание</span>
+          <span class="cluster-log-title" data-i18n="log">ЖУРНАЛ</span>
         </div>
         <div class="cluster-main">
           <div class="voice-gauge">
@@ -496,6 +711,11 @@ pre::-webkit-scrollbar-thumb,.script::-webkit-scrollbar-thumb {
               <div class="system-cell"><div class="system-label">EFFECT MODE</div><div id="mode_state" class="system-value">—</div></div>
               <div class="system-cell"><div class="system-label">MIC STATUS</div><div id="mic_state" class="system-value">—</div></div>
             </div>
+            <div class="delay-module">
+              <div class="delay-head"><span>DELAY PIPELINE</span><span id="delay_value">—</span></div>
+              <div id="delay_track" class="delay-track paused"><i class="delay-safe"></i><i id="delay_asr" class="delay-asr"></i><i id="delay_pulse" class="delay-pulse"></i></div>
+              <div class="delay-labels"><span>OUTPUT</span><span>SAFE BUFFER</span><span>WHISPER WINDOW</span><span>LIVE</span></div>
+            </div>
           </div>
           <div class="cluster-side">
             <div class="readout"><div class="readout-label">WORDS CENSORED</div><div id="censored_count" class="readout-value">0</div></div>
@@ -505,44 +725,86 @@ pre::-webkit-scrollbar-thumb,.script::-webkit-scrollbar-thumb {
               <div id="risk_lamp" class="lamp">RISK</div>
               <div id="late_lamp" class="lamp">LATE</div>
             </div>
+            <div class="telemetry-cell"><div class="system-label">WHISPER CPU</div><div id="cpu_state" class="system-value">—</div><div class="cpu-meter"><i id="cpu_meter"></i></div></div>
+            <div class="telemetry-cell"><div class="system-label">ASR CYCLE</div><div id="asr_state" class="system-value">—</div></div>
           </div>
+          <div class="cluster-log"><pre id="log"></pre></div>
         </div>
       </div>
     </div>
   </section>
 </main>
 <dialog id="advanced_dialog">
-  <h2>Расширенные настройки</h2>
   <div class="advanced-grid">
-    <div><label>Задержка, сек</label><input id="delay" type="number" step=".1"></div>
-    <div><label>Окно распознавания, сек</label><input id="chunk" type="number" step=".1"></div>
-    <div><label>Период распознавания, сек</label><input id="scan_every" type="number" step=".1"></div>
-    <div><label>Подтверждений слова</label><input id="confirmation_count" type="number" min="1" max="4"></div>
-    <div><label>Стабилизация, сек</label><input id="stability_delay" type="number" min="0" max="3" step=".1"></div>
-    <div><label>Модель</label><select id="model">
+    <div><label><span data-i18n="delay">Задержка, сек</span><span class="help-tip" tabindex="0" data-tip-ru="На сколько секунд звук задерживается перед выходом. Должна быть минимум на 2 секунды больше окна распознавания." data-tip-en="How long audio is delayed before output. Must be at least 2 seconds longer than the recognition window.">?</span></label><input id="delay" type="number" step=".1"></div>
+    <div><label><span data-i18n="recognition_window">Окно распознавания, сек</span><span class="help-tip" tabindex="0" data-tip-ru="Сколько последних секунд речи получает Whisper. Большее окно даёт больше контекста, но требует большей задержки." data-tip-en="How many recent seconds Whisper receives. A larger window adds context but requires more delay.">?</span></label><input id="chunk" type="number" step=".1"></div>
+    <div><label><span data-i18n="recognition_period">Период распознавания, сек</span><span class="help-tip" tabindex="0" data-tip-ru="Как часто запускается новое распознавание. Меньше — быстрее реакция и выше нагрузка CPU." data-tip-en="How often recognition runs. Lower values react faster but use more CPU.">?</span></label><input id="scan_every" type="number" step=".1"></div>
+    <div><label><span data-i18n="confirmations">Подтверждений слова</span><span class="help-tip" tabindex="0" data-tip-ru="Сколько перекрывающихся гипотез должны подтвердить слово. Больше — надёжнее, но медленнее." data-tip-en="How many overlapping hypotheses must confirm a word. Higher is safer but slower.">?</span></label><input id="confirmation_count" type="number" min="1" max="4"></div>
+    <div><label><span data-i18n="stabilization">Стабилизация, сек</span><span class="help-tip" tabindex="0" data-tip-ru="Через сколько секунд слово фиксируется без повторного подтверждения." data-tip-en="How long before a word is committed without another confirmation.">?</span></label><input id="stability_delay" type="number" min="0" max="3" step=".1"></div>
+    <div><label><span data-i18n="model">Модель</span><span class="help-tip" tabindex="0" data-tip-ru="Крупные модели точнее, но медленнее и сильнее нагружают процессор." data-tip-en="Larger models are more accurate but slower and use more CPU.">?</span></label><select id="model">
       <option>tiny</option><option>base</option><option>small</option>
       <option>medium</option><option>large-v3</option></select></div>
-    <div><label>Beam size</label><input id="beam_size" type="number" min="1" max="10"></div>
+    <div><label>Beam size<span class="help-tip" tabindex="0" data-tip-ru="Сколько вариантов распознавания сравнивает Whisper. 1 быстрее, 5 обычно точнее." data-tip-en="How many recognition alternatives Whisper compares. 1 is faster; 5 is usually more accurate.">?</span></label><input id="beam_size" type="number" min="1" max="10"></div>
     <div class="wide">
-      <label class="check"><input id="debug_transcript" type="checkbox">Показывать распознанный текст</label>
-      <label class="check"><input id="debug_hypotheses" type="checkbox">Показывать сырые гипотезы</label>
-      <label class="check"><input id="record_output" type="checkbox">Записывать WAV</label>
-      <label class="check"><input id="record_transcript" type="checkbox">Сохранять журнал TXT</label>
+      <label class="check"><input id="debug_transcript" type="checkbox"><span data-i18n="show_transcript">Показывать распознанный текст</span><span class="help-tip" tabindex="0" data-tip-ru="Показывает в журнале только подтверждённые слова Whisper." data-tip-en="Shows confirmed Whisper words in the log.">?</span></label>
+      <label class="check"><input id="debug_hypotheses" type="checkbox"><span data-i18n="show_hypotheses">Показывать сырые гипотезы</span><span class="help-tip" tabindex="0" data-tip-ru="Показывает повторяющиеся сырые окна Whisper. Используйте только для диагностики." data-tip-en="Shows overlapping raw Whisper hypotheses. Use for diagnostics only.">?</span></label>
+      <label class="check"><input id="record_output" type="checkbox"><span data-i18n="record_wav">Записывать WAV</span><span class="help-tip" tabindex="0" data-tip-ru="Сохраняет обработанный звук в папку recordings." data-tip-en="Saves processed audio to the recordings folder.">?</span></label>
+      <label class="check"><input id="record_transcript" type="checkbox"><span data-i18n="record_txt">Сохранять журнал TXT</span><span class="help-tip" tabindex="0" data-tip-ru="Сохраняет временные метки распознавания и замен рядом с WAV." data-tip-en="Saves recognition and replacement timestamps beside the WAV file.">?</span></label>
+      <button class="full" onclick="openWords()" data-i18n="edit_dictionary">Редактировать словарь</button>
+      <button class="full" onclick="openRecordings()" data-i18n="open_recordings">Открыть папку записей</button>
+      <button class="full" onclick="openCustomSounds()" data-i18n="open_custom_sounds">Открыть папку своих звуков</button>
     </div>
   </div>
-  <div class="buttons">
-    <button onclick="document.querySelector('#advanced_dialog').close()">Закрыть</button>
-    <button class="primary" onclick="saveAdvanced()">Сохранить</button>
+  <button class="full" onclick="document.querySelector('#advanced_dialog').close()" data-i18n="close">Закрыть</button>
+</dialog>
+<dialog id="diagnostics_dialog">
+  <h2 data-i18n="diagnostics">Калибровка и аудиомаршрут</h2>
+  <div id="diagnostic_status" class="diagnostic-status">
+    <span id="diagnostic_message" data-i18n="diagnostic_ready">Остановите фильтр перед калибровкой микрофона.</span>
+    <div class="diagnostic-progress"><i id="diagnostic_progress"></i></div>
+    <div id="diagnostic_values" class="diagnostic-values"></div>
   </div>
+  <p data-i18n="route_help">Проверка маршрута отправит три тона в выбранный выход. Убедитесь, что индикатор OBS реагирует.</p>
+  <div class="buttons">
+    <button onclick="startCalibration()" data-i18n="calibrate">Калибровать микрофон</button>
+    <button onclick="startRouteTest()" data-i18n="test_route">Проверить выход</button>
+  </div>
+  <button class="full" onclick="document.querySelector('#diagnostics_dialog').close()" data-i18n="close">Закрыть</button>
 </dialog>
 <dialog id="words_dialog">
-  <h2>Словарь замены</h2>
-  <p>Одна запись на строку: слово, основа со звёздочкой или <code>re:выражение</code>.</p>
+  <h2 data-i18n="dictionary">Словарь замены</h2>
+  <p data-i18n="dictionary_help">Одна запись на строку: слово, основа со звёздочкой или re:выражение.</p>
   <textarea id="words_editor"></textarea>
-  <div class="buttons"><button onclick="document.querySelector('#words_dialog').close()">Отмена</button><button class="primary" onclick="saveWords()">Сохранить</button></div>
+  <div class="buttons"><button onclick="document.querySelector('#words_dialog').close()" data-i18n="cancel">Отмена</button><button class="primary" onclick="saveWords()" data-i18n="save">Сохранить</button></div>
 </dialog>
 <script>
-const ids=["delay","chunk","scan_every","confirmation_count","stability_delay","model","beam_size","mode","effect_volume","debug_transcript","debug_hypotheses","record_output","record_transcript"];
+const ids=["delay","chunk","scan_every","confirmation_count","stability_delay","model","beam_size","language","mode","effect_volume","debug_transcript","debug_hypotheses","record_output","record_transcript"];
+const translations={
+  ru:{settings:"Настройки",microphone:"Микрофон",output:"Вывод",speech_language:"Язык речи",processing:"Обработка — меняется на лету",effect_volume:"Громкость эффекта",start:"▶ Запустить",stop:"■ Остановить",save_settings:"Сохранить настройки",advanced:"Расширенные настройки",diagnostics:"Калибровка и аудиомаршрут",diagnostic_ready:"Остановите фильтр перед калибровкой микрофона.",route_help:"Проверка маршрута отправит три тона в выбранный выход. Убедитесь, что индикатор OBS реагирует.",calibrate:"Калибровать микрофон",test_route:"Проверить выход",edit_dictionary:"Редактировать словарь",open_recordings:"Открыть папку записей",open_custom_sounds:"Открыть папку своих звуков",close_app:"Закрыть приложение",test_text:"Текст для проверки",log:"ЖУРНАЛ",close:"Закрыть",save:"Сохранить",dictionary:"Словарь замены",dictionary_help:"Одна запись на строку: слово, основа со звёздочкой или re:выражение.",cancel:"Отмена",delay:"Задержка, сек",recognition_window:"Окно распознавания, сек",recognition_period:"Период распознавания, сек",confirmations:"Подтверждений слова",stabilization:"Стабилизация, сек",model:"Модель",show_transcript:"Показывать распознанный текст",show_hypotheses:"Показывать сырые гипотезы",record_wav:"Записывать WAV",record_txt:"Сохранять журнал TXT",reverse:"Проиграть наоборот",beep:"ПИП",bark:"Гавканье",meow:"Мяуканье",custom:"Свои звуки",mute:"Заглушить",no_output:"Не выводить звук (только запись)",loading:"Загрузка…",ready:"Готов к запуску",working:"Фильтр работает",waiting:"Ожидание",starting:"Запуск…",all_good:"Всё хорошо",attention:"Внимание",problem:"Проблема",normal:"НОРМА",overload:"ПЕРЕГРУЗ",saved:"Настройки сохранены",effect_applied:"Настройки эффекта применены",no_reports:"Отчётов пока нет.",last_session:"Последняя сессия",censored:"Заменено",minimum_margin:"Минимальный запас",recommended_delay:"Рекомендуемая задержка"},
+  en:{settings:"Settings",microphone:"Microphone",output:"Output",speech_language:"Speech language",processing:"Processing — live switching",effect_volume:"Effect volume",start:"▶ Start",stop:"■ Stop",save_settings:"Save settings",advanced:"Advanced settings",diagnostics:"Calibration and audio route",diagnostic_ready:"Stop the filter before calibrating the microphone.",route_help:"The route test sends three tones to the selected output. Check that the OBS meter responds.",calibrate:"Calibrate microphone",test_route:"Test output",edit_dictionary:"Edit dictionary",open_recordings:"Open recordings folder",open_custom_sounds:"Open custom sounds folder",close_app:"Close application",test_text:"Test script",log:"LOG",close:"Close",save:"Save",dictionary:"Replacement dictionary",dictionary_help:"One entry per line: a word, prefix with an asterisk, or re:expression.",cancel:"Cancel",delay:"Delay, sec",recognition_window:"Recognition window, sec",recognition_period:"Recognition interval, sec",confirmations:"Word confirmations",stabilization:"Stabilization, sec",model:"Model",show_transcript:"Show recognized text",show_hypotheses:"Show raw hypotheses",record_wav:"Record WAV",record_txt:"Save TXT log",reverse:"Play backwards",beep:"BEEP",bark:"Barking",meow:"Meowing",custom:"Custom sounds",mute:"Mute",no_output:"No audio output (record only)",loading:"Loading…",ready:"Ready to start",working:"Filter is running",waiting:"Standby",starting:"Starting…",all_good:"All systems go",attention:"Attention",problem:"Problem",normal:"NORMAL",overload:"OVERLOAD",saved:"Settings saved",effect_applied:"Effect settings applied",no_reports:"No reports yet.",last_session:"Last session",censored:"Censored",minimum_margin:"Minimum margin",recommended_delay:"Recommended delay"}
+};
+let uiLanguage=localStorage.getItem("stream-censor-ui-language")||"ru";
+let lastRunning=false,lastMetrics=null;
+let settingsReady=false,saveTimer=null;
+function t(key){return translations[uiLanguage]?.[key]||translations.ru[key]||key}
+function setTranslatedText(el,text){
+  const input=el.querySelector("input");
+  if(!input){el.textContent=text;return}
+  [...el.childNodes].filter(n=>n.nodeType===3).forEach(n=>n.remove());
+  el.append(document.createTextNode(text));
+}
+function setUILanguage(language){
+  uiLanguage=language==="en"?"en":"ru";
+  localStorage.setItem("stream-censor-ui-language",uiLanguage);
+  document.documentElement.lang=uiLanguage;
+  document.querySelectorAll("[data-i18n]").forEach(el=>setTranslatedText(el,t(el.dataset.i18n)));
+  document.querySelectorAll("[data-i18n-option]").forEach(el=>el.textContent=t(el.dataset.i18nOption));
+  document.querySelectorAll(".help-tip").forEach(el=>el.dataset.tooltip=uiLanguage==="ru"?el.dataset.tipRu:el.dataset.tipEn);
+  document.querySelectorAll("select").forEach(el=>el._refreshCustom?.());
+  document.querySelector("#ui_ru").classList.toggle("active",uiLanguage==="ru");
+  document.querySelector("#ui_en").classList.toggle("active",uiLanguage==="en");
+  updateState(lastRunning);renderMetrics(lastMetrics,lastRunning);
+}
 document.querySelector("#mic_segments").innerHTML=Array.from({length:20},(_,i)=>`<i class="segment${i>=17?" danger":i>=14?" warn":""}"></i>`).join("");
 function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function matchesRule(word,rules){const w=word.toLocaleLowerCase("ru");return rules.some(r=>{if(r.type==="prefix")return w.startsWith(r.value);if(r.type==="exact")return w===r.value;if(r.type==="regex"){try{return new RegExp("^(?:"+r.value+")$","iu").test(w)}catch(e){return false}}return false})}
@@ -599,67 +861,106 @@ function enhanceSelect(select){
     select.selectedIndex=i;sync();
   };
   select.addEventListener("change",sync);rebuild();
+  select._refreshCustom=rebuild;
 }
 document.addEventListener("click",e=>{if(!e.target.closest(".custom-select"))closeSelects()});
 async function load(){
   try {
     const d=await api("/api/state"), c=d.config;
     const inp=document.querySelector("#input_device"),out=document.querySelector("#output_device");
-    d.inputs.forEach(x=>option(inp,x.id,x.label)); option(out,"null","Не выводить звук (только запись)");
+    d.inputs.forEach(x=>option(inp,x.id,x.label)); option(out,"null",t("no_output"));
+    out.options[0].dataset.i18nOption="no_output";
     d.outputs.forEach(x=>option(out,x.id,x.label));
     inp.value=String(c.input_device); out.value=c.output_device===null?"null":String(c.output_device);
     ids.forEach(id=>{const e=document.querySelector("#"+id);e.type==="checkbox"?e.checked=!!c[id]:e.value=c[id]});
     document.querySelector("#script").innerHTML=highlightScript(d.script,d.highlight_rules);
     document.querySelector("#volume_value").value=Number(c.effect_volume||1).toFixed(2);
     document.querySelectorAll("select").forEach(enhanceSelect);
-    renderReport(d.report); updateState(d.running);
+    setUILanguage(uiLanguage);
+    enableAutosave();
+    updateState(d.running);
   } catch(e){document.querySelector("#status").textContent=e.message}
 }
 function values(){const input=document.querySelector("#input_device"),output=document.querySelector("#output_device");const v={input_device:Number(input.value),output_device:output.value==="null"?null:Number(output.value)};
   ids.forEach(id=>{const e=document.querySelector("#"+id);v[id]=e.type==="checkbox"?e.checked:(e.type==="number"?Number(e.value):e.value)});return v}
-async function save(){try{await api("/api/config",{method:"POST",body:JSON.stringify(values())});document.querySelector("#status").textContent="Настройки сохранены";return true}catch(e){alert(e.message);return false}}
-async function saveAdvanced(){if(await save())document.querySelector("#advanced_dialog").close()}
-async function changeRuntimeSettings(){const mode=document.querySelector("#mode").value,effect_volume=Number(document.querySelector("#effect_volume").value);document.querySelector("#volume_value").value=effect_volume.toFixed(2);document.querySelector("#mode_state").textContent=modeLabel(mode);try{await api("/api/runtime",{method:"POST",body:JSON.stringify({mode,effect_volume})});document.querySelector("#status").textContent="Настройки эффекта применены"}catch(e){alert(e.message)}}
+async function save(quiet=false){try{await api("/api/config",{method:"POST",body:JSON.stringify(values())});if(!quiet)document.querySelector("#status").textContent=t("saved");return true}catch(e){if(quiet)document.querySelector("#status").textContent=e.message;else alert(e.message);return false}}
+function scheduleAutosave(){
+  if(!settingsReady)return;
+  clearTimeout(saveTimer);
+  saveTimer=setTimeout(()=>save(true),350);
+}
+function enableAutosave(){
+  if(settingsReady)return;
+  const runtimeIds=new Set(["mode","effect_volume"]);
+  ["input_device","output_device",...ids].forEach(id=>{
+    if(runtimeIds.has(id))return;
+    const element=document.querySelector("#"+id);
+    element.addEventListener(element.type==="number"?"input":"change",scheduleAutosave);
+  });
+  settingsReady=true;
+}
+async function changeRuntimeSettings(){const mode=document.querySelector("#mode").value,effect_volume=Number(document.querySelector("#effect_volume").value);document.querySelector("#volume_value").value=effect_volume.toFixed(2);document.querySelector("#mode_state").textContent=modeLabel(mode);try{await api("/api/runtime",{method:"POST",body:JSON.stringify({mode,effect_volume})});document.querySelector("#status").textContent=t("effect_applied")}catch(e){alert(e.message)}}
 async function previewEffect(){const mode=document.querySelector("#mode").value,volume=document.querySelector("#effect_volume").value;try{await new Audio(`/api/preview?mode=${encodeURIComponent(mode)}&volume=${encodeURIComponent(volume)}&t=${Date.now()}`).play()}catch(e){document.querySelector("#status").textContent="Браузер заблокировал звук — нажми Preview ещё раз"}}
 async function openWords(){const d=await api("/api/words");document.querySelector("#words_editor").value=d.text;document.querySelector("#words_dialog").showModal()}
 async function saveWords(){try{const text=document.querySelector("#words_editor").value;const d=await api("/api/words",{method:"POST",body:JSON.stringify({text})});document.querySelector("#script").innerHTML=highlightScript(d.script,d.highlight_rules);document.querySelector("#words_dialog").close();document.querySelector("#status").textContent=d.restart_required?"Словарь сохранён — перезапусти фильтр для применения":"Словарь сохранён"}catch(e){alert(e.message)}}
-function renderReport(r){const el=document.querySelector("#report");if(!r){el.textContent="Отчётов пока нет.";return}const min=r.min_margin===null?"—":Number(r.min_margin).toFixed(1)+" с";el.innerHTML=`<b>Последняя сессия</b><br>Заменено: ${r.censored}, MISS: ${r.miss}, RISK: ${r.risk}, LATE: ${r.late}<br>Минимальный запас: ${min}<br>Рекомендуемая задержка: <b>${r.recommended_delay} с</b>`}
-function stateLabel(value){return ({waiting:"ожидание",loading:"загрузка…",starting:"запуск…",ready:"готова",running:"работает",stopped:"остановлен",error:"ошибка"})[value]||"—"}
-function modeLabel(value){return ({reverse:"REVERSE",beep:"BEEP",bark:"BARK",meow:"MEOW",mute:"MUTE"})[value]||"—"}
+function stateLabel(value){const labels=uiLanguage==="ru"?{waiting:"ожидание",loading:"загрузка…",starting:"запуск…",ready:"готова",running:"работает",stopped:"остановлен",error:"ошибка"}:{waiting:"waiting",loading:"loading…",starting:"starting…",ready:"ready",running:"running",stopped:"stopped",error:"error"};return labels[value]||"—"}
+function modeLabel(value){return ({reverse:"REVERSE",beep:"BEEP",bark:"BARK",meow:"MEOW",custom:"CUSTOM",mute:"MUTE"})[value]||"—"}
 function lightSegments(percent){
   const lit=Math.round(Math.max(0,Math.min(100,percent))/100*20);
   document.querySelectorAll("#mic_segments .segment").forEach((el,i)=>el.classList.toggle("lit",i<lit));
 }
 function setLamp(id,on,kind){const el=document.querySelector(id);el.className="lamp"+(on?` on-${kind}`:"")}
+function renderTelemetry(m,running){
+  const model=document.querySelector("#model_state");
+  model.classList.toggle("model-loading",running&&(!m||m.model_state==="loading"));
+  const cpu=Math.max(0,Number(m?.cpu_percent)||0);
+  document.querySelector("#cpu_state").textContent=running?`${cpu.toFixed(0)}%`:"—";
+  const cpuMeter=document.querySelector("#cpu_meter");
+  cpuMeter.style.width=Math.min(100,cpu)+"%";
+  cpuMeter.style.background=cpu>85?"var(--red)":cpu>60?"var(--yellow)":"var(--green)";
+  const duration=m?.asr_duration;
+  const asrText=m?.asr_state==="transcribing"
+    ?(uiLanguage==="ru"?"РАСПОЗНАВАНИЕ":"TRANSCRIBING")
+    :duration===null||duration===undefined?"—":`${Number(duration).toFixed(2)} SEC`;
+  document.querySelector("#asr_state").textContent=running?asrText:"—";
+  const delay=Math.max(0.1,Number(m?.delay_seconds)||Number(document.querySelector("#delay").value)||7);
+  const chunk=Math.max(0,Number(m?.chunk_seconds)||Number(document.querySelector("#chunk").value)||3);
+  document.querySelector("#delay_value").textContent=running?`${delay.toFixed(1)} SEC`:"—";
+  document.querySelector("#delay_asr").style.width=Math.min(100,chunk/delay*100)+"%";
+  document.querySelector("#delay_pulse").style.animationDuration=delay+"s";
+  document.querySelector("#delay_track").classList.toggle("paused",!running);
+}
 function renderMetrics(m,running){
   const health=document.querySelector("#health");
   health.className="health";
   if(!running){
-    health.textContent="Ожидание";
+    health.textContent=t("waiting");
     document.querySelector("#model_state").textContent="—";
     document.querySelector("#audio_state").textContent="—";
     document.querySelector("#mic_state").textContent="—";
     document.querySelector("#mic_db").innerHTML="—<small> dBFS</small>";
     document.querySelector("#mode_state").textContent=modeLabel(document.querySelector("#mode").value);
     lightSegments(0);setLamp("#clip_lamp",false,"red");setLamp("#risk_lamp",false,"yellow");setLamp("#late_lamp",false,"red");
-    document.querySelector("#censored_count").textContent=m?.censored||0;
+    document.querySelector("#censored_count").textContent="0";
     document.querySelector("#margin_state").textContent="—";
+    renderTelemetry(m,false);
     return;
   }
   if(!m){
-    health.classList.add("yellow"); health.textContent="Запуск…";
-    document.querySelector("#model_state").textContent="ожидание данных";
-    document.querySelector("#audio_state").textContent="ожидание данных";
+    health.classList.add("yellow"); health.textContent=t("starting");
+    document.querySelector("#model_state").textContent=uiLanguage==="ru"?"ожидание данных":"waiting for data";
+    document.querySelector("#audio_state").textContent=uiLanguage==="ru"?"ожидание данных":"waiting for data";
+    renderTelemetry(null,true);
     return;
   }
-  const names={green:"Всё хорошо",yellow:"Внимание",red:"Проблема",idle:"Ожидание"};
-  health.classList.add(m.overall||"yellow"); health.textContent=names[m.overall]||"Запуск…";
+  const names={green:t("all_good"),yellow:t("attention"),red:t("problem"),idle:t("waiting")};
+  health.classList.add(m.overall||"yellow"); health.textContent=names[m.overall]||t("starting");
   document.querySelector("#model_state").textContent=stateLabel(m.model_state);
   document.querySelector("#audio_state").textContent=stateLabel(m.audio_state);
   document.querySelector("#mode_state").textContent=modeLabel(m.mode);
   const rms=Math.max(Number(m.mic_rms)||0,1e-6),db=20*Math.log10(rms);
   const percent=Math.max(0,Math.min(100,(db+60)/60*100));
-  document.querySelector("#mic_state").textContent=m.clipping?"ПЕРЕГРУЗ":"НОРМА";
+  document.querySelector("#mic_state").textContent=m.clipping?t("overload"):t("normal");
   document.querySelector("#mic_db").innerHTML=`${db.toFixed(0)}<small> dBFS</small>`;
   lightSegments(percent);
   document.querySelector("#censored_count").textContent=m.censored||0;
@@ -667,14 +968,47 @@ function renderMetrics(m,running){
   setLamp("#clip_lamp",!!m.clipping,"red");
   setLamp("#risk_lamp",Number(m.risk)>0,"yellow");
   setLamp("#late_lamp",Number(m.late)>0,"red");
+  renderTelemetry(m,true);
   if(m.last_error)document.querySelector("#audio_state").title=m.last_error;
 }
-async function startApp(){if(!await save())return;try{await api("/api/start",{method:"POST",body:"{}"});updateState(true)}catch(e){alert(e.message)}}
+async function startApp(){clearTimeout(saveTimer);if(!await save(true))return;try{await api("/api/start",{method:"POST",body:"{}"});updateState(true)}catch(e){alert(e.message)}}
 async function stopApp(){await api("/api/stop",{method:"POST",body:"{}"})}
 async function openRecordings(){await api("/api/open-recordings",{method:"POST",body:"{}"})}
+async function openCustomSounds(){await api("/api/open-custom-sounds",{method:"POST",body:"{}"})}
+function openDiagnostics(){
+  document.querySelector("#diagnostics_dialog").showModal();
+  pollDiagnostics();
+}
+async function startCalibration(){
+  if(lastRunning){alert(uiLanguage==="ru"?"Сначала остановите фильтр.":"Stop the filter first.");return}
+  const input=document.querySelector("#input_device").value;
+  try{await api("/api/calibrate",{method:"POST",body:JSON.stringify({input_device:Number(input)})});pollDiagnostics()}catch(e){alert(e.message)}
+}
+async function startRouteTest(){
+  const output=document.querySelector("#output_device").value;
+  try{await api("/api/route-test",{method:"POST",body:JSON.stringify({output_device:output==="null"?null:Number(output)})});pollDiagnostics()}catch(e){alert(e.message)}
+}
+async function pollDiagnostics(){
+  if(!document.querySelector("#diagnostics_dialog").open)return;
+  try{
+    const d=await api("/api/diagnostics"),box=document.querySelector("#diagnostic_status");
+    box.className="diagnostic-status"+(d.result?.rating?` ${d.result.rating}`:d.state==="error"?" red":"");
+    document.querySelector("#diagnostic_progress").style.width=((d.progress||0)*100)+"%";
+    let message=uiLanguage==="ru"?"Готово к диагностике.":"Ready for diagnostics.";
+    if(d.phase==="silence")message=uiLanguage==="ru"?"Сохраняйте тишину…":"Keep silent…";
+    if(d.phase==="speech")message=uiLanguage==="ru"?"Говорите обычным голосом…":"Speak in your normal voice…";
+    if(d.phase==="route")message=uiLanguage==="ru"?"Отправляю тестовые тоны…":"Sending test tones…";
+    if(d.error)message=d.error;
+    if(d.result?.message)message=d.result.message;
+    document.querySelector("#diagnostic_message").textContent=message;
+    const r=d.result||{},values=document.querySelector("#diagnostic_values");
+    values.innerHTML=r.noise_db===undefined?"":`<div class="diagnostic-value">NOISE<b>${r.noise_db} dBFS</b></div><div class="diagnostic-value">SPEECH<b>${r.speech_db} dBFS</b></div><div class="diagnostic-value">SNR<b>${r.snr_db} dB</b></div><div class="diagnostic-value">PEAK<b>${r.peak_db} dBFS</b></div>`;
+  }catch(e){}
+  setTimeout(pollDiagnostics,300);
+}
 async function closeApp(){
-  if(!confirm("Остановить фильтр и закрыть Stream Censor?"))return;
-  document.querySelector("#status").textContent="Закрытие…";
+  if(!confirm(uiLanguage==="ru"?"Остановить фильтр и закрыть Stream Censor?":"Stop the filter and close Stream Censor?"))return;
+  document.querySelector("#status").textContent=uiLanguage==="ru"?"Закрытие…":"Closing…";
   try{await api("/api/shutdown",{method:"POST",body:"{}"})}catch(e){}
   setTimeout(()=>{
     window.open("","_self");
@@ -682,8 +1016,8 @@ async function closeApp(){
     document.body.innerHTML="<main style='display:block;height:auto;max-width:620px;margin:80px auto'><section class='panel'><h1>Stream Censor закрыт</h1><p>Сервер и консоль остановлены. Эту вкладку можно закрыть.</p></section></main>";
   },300);
 }
-function updateState(r){document.querySelector("#start").disabled=r;document.querySelector("#stop").disabled=!r;document.querySelector("#status").textContent=r?"Фильтр работает":"Готов к запуску"}
-async function poll(){try{const d=await api("/api/log");const p=document.querySelector("#log");if(p.textContent!==d.log){p.textContent=d.log;p.scrollTop=p.scrollHeight}updateState(d.running);renderMetrics(d.metrics,d.running);if(!d.running&&d.report)renderReport(d.report)}catch(e){}setTimeout(poll,350)}
+function updateState(r){lastRunning=r;document.querySelector("#start").disabled=r;document.querySelector("#stop").disabled=!r;document.querySelector("#status").textContent=r?t("working"):t("ready")}
+async function poll(){try{const d=await api("/api/log");const p=document.querySelector("#log");if(p.textContent!==d.log){p.textContent=d.log;p.scrollTop=p.scrollHeight}lastMetrics=d.metrics;updateState(d.running);renderMetrics(d.metrics,d.running)}catch(e){}setTimeout(poll,350)}
 load();poll();
 </script>
 </body></html>"""
@@ -732,7 +1066,6 @@ class Handler(BaseHTTPRequestHandler):
                     "script": TEST_SCRIPT.read_text(encoding="utf-8"),
                     "highlight_rules": highlight_rules(WORDS_PATH),
                     "running": STATE.running(),
-                    "report": latest_report(),
                 })
             except Exception as error:
                 self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -742,18 +1075,19 @@ class Handler(BaseHTTPRequestHandler):
                     "log": STATE.log_text(),
                     "running": STATE.running(),
                     "metrics": runtime_status(),
-                    "report": None if STATE.running() else latest_report(),
                 }
             )
         elif path == "/api/health":
             self._json({"app": "stream-censor", "running": STATE.running()})
         elif path == "/api/words":
             self._json({"text": WORDS_PATH.read_text(encoding="utf-8")})
+        elif path == "/api/diagnostics":
+            self._json(DIAGNOSTICS.snapshot())
         elif path == "/api/preview":
             parameters = parse_qs(urlparse(self.path).query)
             mode = parameters.get("mode", ["beep"])[0]
             volume = float(parameters.get("volume", ["1"])[0])
-            if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
+            if mode not in {"reverse", "beep", "bark", "meow", "custom", "mute"}:
                 mode = "beep"
             body = preview_wav(mode, volume)
             self.send_response(HTTPStatus.OK)
@@ -772,9 +1106,11 @@ class Handler(BaseHTTPRequestHandler):
                 values = self._body()
                 if values["delay"] < values["chunk"] + 2:
                     raise ValueError("Задержка должна быть минимум на 2 секунды больше окна.")
+                if values.get("language") not in {"ru", "en"}:
+                    raise ValueError("Поддерживаются языки РУ и EN.")
                 allowed = {
                     "input_device", "output_device", "delay", "chunk", "scan_every",
-                    "model", "beam_size", "mode", "debug_transcript", "record_output",
+                    "model", "beam_size", "language", "mode", "debug_transcript", "record_output",
                     "record_transcript", "effect_volume", "confirmation_count",
                     "stability_delay", "debug_hypotheses",
                 }
@@ -786,11 +1122,29 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/stop":
                 STATE.stop()
                 self._json({"ok": True})
+            elif path == "/api/calibrate":
+                if STATE.running():
+                    raise ValueError("Сначала остановите фильтр.")
+                data = self._body()
+                config = load_config(DEFAULT_CONFIG)
+                DIAGNOSTICS.start_calibration(
+                    data.get("input_device"),
+                    int(config.get("sample_rate", 48000)),
+                )
+                self._json({"ok": True})
+            elif path == "/api/route-test":
+                data = self._body()
+                config = load_config(DEFAULT_CONFIG)
+                DIAGNOSTICS.start_route_test(
+                    data.get("output_device"),
+                    int(config.get("sample_rate", 48000)),
+                )
+                self._json({"ok": True})
             elif path == "/api/runtime":
                 data = self._body()
                 mode = str(data.get("mode", ""))
                 effect_volume = float(data.get("effect_volume", 1.0))
-                if mode not in {"reverse", "beep", "bark", "meow", "mute"}:
+                if mode not in {"reverse", "beep", "bark", "meow", "custom", "mute"}:
                     raise ValueError("Неизвестный режим обработки.")
                 if not 0 <= effect_volume <= 2:
                     raise ValueError("Громкость должна быть от 0 до 2.")
@@ -824,6 +1178,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/open-recordings":
                 RECORDINGS.mkdir(exist_ok=True)
                 subprocess.Popen(["open", str(RECORDINGS)])
+                self._json({"ok": True})
+            elif path == "/api/open-custom-sounds":
+                CUSTOM_SOUNDS.mkdir(exist_ok=True)
+                subprocess.Popen(["open", str(CUSTOM_SOUNDS)])
                 self._json({"ok": True})
             elif path == "/api/shutdown":
                 self._json({"ok": True})

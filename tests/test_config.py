@@ -11,12 +11,13 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(
-                json.dumps({"delay": 7, "beam_size": 5}),
+                json.dumps({"delay": 7, "beam_size": 5, "input_activity_threshold": 0.004}),
                 encoding="utf-8",
             )
             args = build_parser(load_config(path)).parse_args([])
             self.assertEqual(args.delay, 7)
             self.assertEqual(args.beam_size, 5)
+            self.assertEqual(args.input_activity_threshold, 0.004)
 
     def test_command_line_overrides_config(self):
         args = build_parser({"delay": 7}).parse_args(["--delay", "9"])

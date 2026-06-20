@@ -11,6 +11,8 @@
   "censor_tail_ms": 80,
   "crossfade_ms": 8,
   "sample_rate": 48000,
+  "input_activity_threshold": 0.003,
+  "custom_sounds_directory": "custom_sounds",
   "model": "small",
   "compute_type": "int8",
   "language": "ru",
