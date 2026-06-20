@@ -469,7 +469,8 @@ input:focus,select:focus { border-color:#63e9ad; box-shadow:inset 0 0 10px #000,
 .custom-select-menu::-webkit-scrollbar-track { background:#07110d }
 .custom-select-menu::-webkit-scrollbar-thumb { border:2px solid #07110d; background:#396b55 }
 .check { display:flex; gap:9px; align-items:center; margin:12px 0; color:#79caa9;
-  font-size:11px; text-transform:uppercase }
+  width:max-content; max-width:100%; font-size:11px; text-transform:uppercase;
+  cursor:pointer }
 .check input { width:14px; height:14px; appearance:none; border:1px solid #477661;
   background:#07110d; padding:0 }
 .check input:checked { background:#55efaa; box-shadow:inset 0 0 0 3px #092117,0 0 7px #35dc8d }
@@ -617,11 +618,16 @@ dialog textarea { width:100%; min-height:340px; resize:vertical; padding:12px;
   margin-left:5px; align-items:center; justify-content:center; border:1px solid #4a8068;
   border-radius:50%; color:#ffcc61; font-size:9px; cursor:help; vertical-align:1px }
 .help-tip::after { content:attr(data-tooltip); position:absolute; z-index:100;
-  left:50%; bottom:calc(100% + 8px); display:none; width:260px; padding:9px 10px;
+  bottom:calc(100% + 8px); display:none; width:260px; padding:9px 10px;
   border:1px solid #4b8068; color:#91e9c4; background:#06110d;
   font:10px/1.45 Menlo,Monaco,monospace; letter-spacing:0; text-transform:none;
-  transform:translateX(-50%); box-shadow:0 8px 22px #000,inset 0 0 12px #000 }
-.help-tip:hover::after,.help-tip:focus::after { display:block }
+  box-shadow:0 8px 22px #000,inset 0 0 12px #000 }
+.advanced-grid > div:nth-child(odd) .help-tip::after { left:0 }
+.advanced-grid > div:nth-child(even) .help-tip::after { right:0 }
+.advanced-grid > div:nth-child(-n+2) .help-tip::after {
+  top:calc(100% + 8px); bottom:auto;
+}
+.help-tip:hover::after { display:block }
 .display-panel { position:relative; overflow:hidden; padding:12px;
   border-color:#344b43; background:#111715 }
 .display-panel::after { content:""; position:absolute; inset:40px 12px 12px;
@@ -736,20 +742,20 @@ pre::-webkit-scrollbar-thumb,.script::-webkit-scrollbar-thumb {
 </main>
 <dialog id="advanced_dialog">
   <div class="advanced-grid">
-    <div><label><span data-i18n="delay">Задержка, сек</span><span class="help-tip" tabindex="0" data-tip-ru="На сколько секунд звук задерживается перед выходом. Должна быть минимум на 2 секунды больше окна распознавания." data-tip-en="How long audio is delayed before output. Must be at least 2 seconds longer than the recognition window.">?</span></label><input id="delay" type="number" step=".1"></div>
-    <div><label><span data-i18n="recognition_window">Окно распознавания, сек</span><span class="help-tip" tabindex="0" data-tip-ru="Сколько последних секунд речи получает Whisper. Большее окно даёт больше контекста, но требует большей задержки." data-tip-en="How many recent seconds Whisper receives. A larger window adds context but requires more delay.">?</span></label><input id="chunk" type="number" step=".1"></div>
-    <div><label><span data-i18n="recognition_period">Период распознавания, сек</span><span class="help-tip" tabindex="0" data-tip-ru="Как часто запускается новое распознавание. Меньше — быстрее реакция и выше нагрузка CPU." data-tip-en="How often recognition runs. Lower values react faster but use more CPU.">?</span></label><input id="scan_every" type="number" step=".1"></div>
-    <div><label><span data-i18n="confirmations">Подтверждений слова</span><span class="help-tip" tabindex="0" data-tip-ru="Сколько перекрывающихся гипотез должны подтвердить слово. Больше — надёжнее, но медленнее." data-tip-en="How many overlapping hypotheses must confirm a word. Higher is safer but slower.">?</span></label><input id="confirmation_count" type="number" min="1" max="4"></div>
-    <div><label><span data-i18n="stabilization">Стабилизация, сек</span><span class="help-tip" tabindex="0" data-tip-ru="Через сколько секунд слово фиксируется без повторного подтверждения." data-tip-en="How long before a word is committed without another confirmation.">?</span></label><input id="stability_delay" type="number" min="0" max="3" step=".1"></div>
-    <div><label><span data-i18n="model">Модель</span><span class="help-tip" tabindex="0" data-tip-ru="Крупные модели точнее, но медленнее и сильнее нагружают процессор." data-tip-en="Larger models are more accurate but slower and use more CPU.">?</span></label><select id="model">
+    <div><label><span data-i18n="delay">Задержка, сек</span><span class="help-tip" data-tip-ru="На сколько секунд звук задерживается перед выходом. Должна быть минимум на 2 секунды больше окна распознавания." data-tip-en="How long audio is delayed before output. Must be at least 2 seconds longer than the recognition window.">?</span></label><input id="delay" type="number" step=".1"></div>
+    <div><label><span data-i18n="recognition_window">Окно распознавания, сек</span><span class="help-tip" data-tip-ru="Сколько последних секунд речи получает Whisper. Большее окно даёт больше контекста, но требует большей задержки." data-tip-en="How many recent seconds Whisper receives. A larger window adds context but requires more delay.">?</span></label><input id="chunk" type="number" step=".1"></div>
+    <div><label><span data-i18n="recognition_period">Период распознавания, сек</span><span class="help-tip" data-tip-ru="Как часто запускается новое распознавание. Меньше — быстрее реакция и выше нагрузка CPU." data-tip-en="How often recognition runs. Lower values react faster but use more CPU.">?</span></label><input id="scan_every" type="number" step=".1"></div>
+    <div><label><span data-i18n="confirmations">Подтверждений слова</span><span class="help-tip" data-tip-ru="Сколько перекрывающихся гипотез должны подтвердить слово. Больше — надёжнее, но медленнее." data-tip-en="How many overlapping hypotheses must confirm a word. Higher is safer but slower.">?</span></label><input id="confirmation_count" type="number" min="1" max="4"></div>
+    <div><label><span data-i18n="stabilization">Стабилизация, сек</span><span class="help-tip" data-tip-ru="Через сколько секунд слово фиксируется без повторного подтверждения." data-tip-en="How long before a word is committed without another confirmation.">?</span></label><input id="stability_delay" type="number" min="0" max="3" step=".1"></div>
+    <div><label><span data-i18n="model">Модель</span><span class="help-tip" data-tip-ru="Крупные модели точнее, но медленнее и сильнее нагружают процессор." data-tip-en="Larger models are more accurate but slower and use more CPU.">?</span></label><select id="model">
       <option>tiny</option><option>base</option><option>small</option>
       <option>medium</option><option>large-v3</option></select></div>
-    <div><label>Beam size<span class="help-tip" tabindex="0" data-tip-ru="Сколько вариантов распознавания сравнивает Whisper. 1 быстрее, 5 обычно точнее." data-tip-en="How many recognition alternatives Whisper compares. 1 is faster; 5 is usually more accurate.">?</span></label><input id="beam_size" type="number" min="1" max="10"></div>
+    <div><label>Beam size<span class="help-tip" data-tip-ru="Сколько вариантов распознавания сравнивает Whisper. 1 быстрее, 5 обычно точнее." data-tip-en="How many recognition alternatives Whisper compares. 1 is faster; 5 is usually more accurate.">?</span></label><input id="beam_size" type="number" min="1" max="10"></div>
     <div class="wide">
-      <label class="check"><input id="debug_transcript" type="checkbox"><span data-i18n="show_transcript">Показывать распознанный текст</span><span class="help-tip" tabindex="0" data-tip-ru="Показывает в журнале только подтверждённые слова Whisper." data-tip-en="Shows confirmed Whisper words in the log.">?</span></label>
-      <label class="check"><input id="debug_hypotheses" type="checkbox"><span data-i18n="show_hypotheses">Показывать сырые гипотезы</span><span class="help-tip" tabindex="0" data-tip-ru="Показывает повторяющиеся сырые окна Whisper. Используйте только для диагностики." data-tip-en="Shows overlapping raw Whisper hypotheses. Use for diagnostics only.">?</span></label>
-      <label class="check"><input id="record_output" type="checkbox"><span data-i18n="record_wav">Записывать WAV</span><span class="help-tip" tabindex="0" data-tip-ru="Сохраняет обработанный звук в папку recordings." data-tip-en="Saves processed audio to the recordings folder.">?</span></label>
-      <label class="check"><input id="record_transcript" type="checkbox"><span data-i18n="record_txt">Сохранять журнал TXT</span><span class="help-tip" tabindex="0" data-tip-ru="Сохраняет временные метки распознавания и замен рядом с WAV." data-tip-en="Saves recognition and replacement timestamps beside the WAV file.">?</span></label>
+      <label class="check"><input id="debug_transcript" type="checkbox"><span data-i18n="show_transcript">Показывать распознанный текст</span><span class="help-tip" data-tip-ru="Показывает в журнале только подтверждённые слова Whisper." data-tip-en="Shows confirmed Whisper words in the log.">?</span></label>
+      <label class="check"><input id="debug_hypotheses" type="checkbox"><span data-i18n="show_hypotheses">Показывать сырые гипотезы</span><span class="help-tip" data-tip-ru="Показывает повторяющиеся сырые окна Whisper. Используйте только для диагностики." data-tip-en="Shows overlapping raw Whisper hypotheses. Use for diagnostics only.">?</span></label>
+      <label class="check"><input id="record_output" type="checkbox"><span data-i18n="record_wav">Записывать WAV</span><span class="help-tip" data-tip-ru="Сохраняет обработанный звук в папку recordings." data-tip-en="Saves processed audio to the recordings folder.">?</span></label>
+      <label class="check"><input id="record_transcript" type="checkbox"><span data-i18n="record_txt">Сохранять журнал TXT</span><span class="help-tip" data-tip-ru="Сохраняет временные метки распознавания и замен рядом с WAV." data-tip-en="Saves recognition and replacement timestamps beside the WAV file.">?</span></label>
       <button class="full" onclick="openWords()" data-i18n="edit_dictionary">Редактировать словарь</button>
       <button class="full" onclick="openRecordings()" data-i18n="open_recordings">Открыть папку записей</button>
       <button class="full" onclick="openCustomSounds()" data-i18n="open_custom_sounds">Открыть папку своих звуков</button>
@@ -864,6 +870,9 @@ function enhanceSelect(select){
   select._refreshCustom=rebuild;
 }
 document.addEventListener("click",e=>{if(!e.target.closest(".custom-select"))closeSelects()});
+document.addEventListener("click",e=>{
+  if(e.target.closest(".help-tip")){e.preventDefault();e.stopPropagation()}
+});
 async function load(){
   try {
     const d=await api("/api/state"), c=d.config;
